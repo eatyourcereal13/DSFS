@@ -1,0 +1,20 @@
+[package]
+name = "dsfs-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "dsfs"
+path = "src/main.rs"
+
+[dependencies]
+thiserror.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+dsfs-core.workspace = true
+dsfs-checker.workspace = true
+dsfs-raft.workspace = true
