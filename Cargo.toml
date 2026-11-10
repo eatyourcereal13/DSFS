@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dsfs-core",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/dsfs"
+authors = ["DSFS Authors"]
+
+[workspace.dependencies]
+thiserror = "1.0"
+rand = "0.8"
+rand_chacha = "0.3"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
