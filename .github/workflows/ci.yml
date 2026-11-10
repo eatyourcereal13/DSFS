@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 env:
@@ -31,23 +32,55 @@ jobs:
 
   test:
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        profile: [debug, release]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
-      - run: cargo test --workspace --release
+      - name: cargo test (${{ matrix.profile }})
+        run: |
+          if [ "${{ matrix.profile }}" = "release" ]; then
+            cargo test --workspace --release
+          else
+            cargo test --workspace
+          fi
+
+  benches-compile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench --workspace --no-run
+
+  cli-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build CLI
+        run: cargo build --release -p dsfs-cli
+      - name: Init + run + validate + replay
+        run: |
+          ./target/release/dsfs init --force
+          ./target/release/dsfs run configs/scenarios/example.yaml --out /tmp/example.jsonl
+          ./target/release/dsfs validate /tmp/example.jsonl
+          ./target/release/dsfs replay /tmp/example.jsonl
 
   forbid-real-time:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Forbid std::time::Instant / SystemTime in dsfs-core/src
+      - name: Forbid std::time::Instant / SystemTime in engine crates
         run: |
           set -e
-          hits=$(grep -RnE 'std::time::(Instant|SystemTime)' crates/dsfs-core/src || true)
+          hits=$(grep -RnE 'std::time::(Instant|SystemTime)' \
+            crates/dsfs-core/src crates/dsfs-raft/src crates/dsfs-checker/src || true)
           if [ -n "$hits" ]; then
-            echo "Forbidden real-time use in dsfs-core:"
+            echo "Forbidden real-time use:"
             echo "$hits"
             exit 1
           fi
