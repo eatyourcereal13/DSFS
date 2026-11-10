@@ -15,9 +15,6 @@ use crate::time::{Duration, VirtualTime};
 pub use crate::network::{Delivery, FullNetwork, LinkConfig};
 
 /// Base slowdown per incoming event, in nanoseconds, when `slow_factor > 1`.
-///
-/// Effective extra delay = `(slow_factor - 1.0) * SLOW_BASE_NANOS`. This
-/// is a fixed semantic constant, not a tunable (see DD-011).
 const SLOW_BASE_NANOS: u64 = 1_000_000;
 
 /// Engine configuration.
@@ -38,13 +35,10 @@ impl Default for EngineConfig {
     }
 }
 
-/// One slot in the engine's node table.
 #[derive(Debug)]
 struct NodeEntry {
     node: NodeImpl,
     availability: Availability,
-    /// Multiplier on incoming message delivery delay.
-    /// `1.0` = normal. `2.0` = every incoming message delayed by `SLOW_BASE`.
     slow_factor: f64,
 }
 
@@ -97,8 +91,7 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
     ///
     /// # Errors
     ///
-    /// Returns an error if a node with the same id already exists, or if
-    /// the node's `on_start` actions cannot be routed.
+    /// Returns an error if a node with the same id already exists.
     pub fn add_ping_node(&mut self, node: PingNode) -> io::Result<()> {
         self.add_node(NodeImpl::Ping(node))
     }
@@ -108,7 +101,7 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
     /// # Errors
     ///
     /// Returns an error if a node with the same id already exists, or if
-    /// the node's `on_start` actions cannot be routed.
+    /// the node's start actions cannot be routed.
     pub fn add_node(&mut self, mut node: NodeImpl) -> io::Result<()> {
         let id = node.id();
         if self.nodes.contains_key(&id) {
@@ -187,6 +180,55 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         self.nodes.get(&node_id).map(|e| e.availability)
     }
 
+    /// Finds the current Raft leader among active nodes, if any.
+    #[must_use]
+    pub fn find_leader(&self) -> Option<NodeId> {
+        for (id, entry) in &self.nodes {
+            if !entry.availability.is_active() {
+                continue;
+            }
+            if entry.node.raft_leader_id().is_some() {
+                return Some(*id);
+            }
+        }
+        None
+    }
+
+    /// Returns the commands applied by the given Raft node, if it is one.
+    #[must_use]
+    pub fn raft_applied(&self, node_id: NodeId) -> Option<&[Vec<u8>]> {
+        self.nodes.get(&node_id)?.node.raft_applied()
+    }
+
+    /// Returns the commit index of the given Raft node, if it is one.
+    #[must_use]
+    pub fn raft_commit_index(&self, node_id: NodeId) -> Option<u64> {
+        self.nodes.get(&node_id)?.node.raft_commit_index()
+    }
+
+    /// Submits a client command to the current leader.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` if there is no active leader.
+    pub fn submit_command(&mut self, command: Vec<u8>) -> io::Result<()> {
+        let leader = self
+            .find_leader()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no leader available"))?;
+        self.queue.schedule(
+            self.clock,
+            Priority::Client,
+            EventPayload::new(
+                EventKind::ClientCommand {
+                    to: leader,
+                    command,
+                },
+                None,
+            ),
+        );
+        Ok(())
+    }
+
     /// Consumes the engine and returns the log.
     #[must_use]
     pub fn into_log(self) -> L {
@@ -205,18 +247,39 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         self.processed_events
     }
 
-    /// Runs the engine until the queue is empty or `max_events` is reached.
+    /// Runs the engine until the queue is empty or the remaining global
+    /// budget from `EngineConfig::max_events` is exhausted.
     ///
     /// # Errors
     ///
     /// Propagates I/O errors from the event log.
     pub fn run(&mut self) -> io::Result<RunOutcome> {
-        while let Some(event) = self.queue.pop() {
-            if self.processed_events >= self.config.max_events {
-                return Ok(RunOutcome::HitEventLimit {
+        let budget = self.config.max_events.saturating_sub(self.processed_events);
+        self.run_until(budget)
+    }
+
+    /// Runs the engine until the queue is empty or `budget` more events
+    /// have been processed.
+    ///
+    /// Use this for interactive control:
+    ///
+    /// ```ignore
+    /// e.run_until(10_000)?;    // let elections settle
+    /// e.submit_command(...)?;
+    /// e.run_until(5_000)?;     // let the command replicate and commit
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Propagates I/O errors from the event log.
+    pub fn run_until(&mut self, budget: u64) -> io::Result<RunOutcome> {
+        let target = self.processed_events.saturating_add(budget);
+        while self.processed_events < target {
+            let Some(event) = self.queue.pop() else {
+                return Ok(RunOutcome::Completed {
                     processed: self.processed_events,
                 });
-            }
+            };
             self.clock = event.key.time;
             let event_id = EventId(self.next_event_id);
             self.next_event_id += 1;
@@ -226,7 +289,7 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             let caused_by = payload.caused_by;
             self.dispatch_to_node(payload, event_id, caused_by)?;
         }
-        Ok(RunOutcome::Completed {
+        Ok(RunOutcome::HitEventLimit {
             processed: self.processed_events,
         })
     }
@@ -240,10 +303,9 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         let node_id = match &payload.kind {
             EventKind::TimerFired { node, .. } => *node,
             EventKind::MessageDelivered { to, .. } => *to,
+            EventKind::ClientCommand { to, .. } => *to,
         };
 
-        // Availability check: offline nodes do not process any event.
-        // Timer expiry is ignored; message delivery is logged as a drop.
         let availability = self
             .nodes
             .get(&node_id)
@@ -256,7 +318,7 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             return self.handle_offline_dispatch(node_id, event_id, caused_by, &payload);
         }
 
-        // Log delivery of a network message.
+        // Log delivery of a network message before the node reacts.
         if let EventKind::MessageDelivered { from, .. } = &payload.kind {
             self.log.record(LogRecord {
                 event_id,
@@ -288,10 +350,6 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         caused_by: Option<EventId>,
         payload: &EventPayload,
     ) -> io::Result<()> {
-        // If it's a message delivery to an offline node, log it as dropped
-        // (semantically: the network cannot reach a downed node). If it's a
-        // timer expiry, log it as ignored (semantically: the node was not
-        // running when the timer fired).
         match &payload.kind {
             EventKind::MessageDelivered { from, .. } => {
                 self.log.record(LogRecord {
@@ -304,7 +362,7 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
                     caused_by,
                 })?;
             }
-            EventKind::TimerFired { .. } => {
+            EventKind::TimerFired { .. } | EventKind::ClientCommand { .. } => {
                 self.log.record(LogRecord {
                     event_id,
                     time: self.clock,
@@ -452,6 +510,7 @@ pub enum RunOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node::PingNode;
     use crate::time::Duration;
 
     fn make_engine() -> SimulationEngine<InMemoryLog, NullNetwork> {
@@ -570,6 +629,15 @@ mod tests {
         let err = e
             .set_availability(NodeId(99), Availability::Offline)
             .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn submit_command_without_leader_errors() {
+        let mut e = make_engine();
+        e.add_ping_node(PingNode::new(NodeId(1), Duration::from_millis(100)))
+            .unwrap();
+        let err = e.submit_command(b"x".to_vec()).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }

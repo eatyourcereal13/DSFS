@@ -1,5 +1,4 @@
-//! Virtual node identifiers, availability states, and the `NodeImpl`
-//! dispatch enum.
+//! Virtual node identifiers, availability states, and `NodeImpl`.
 
 use dsfs_raft::{PeerId, RaftNode, RaftOutput};
 
@@ -10,7 +9,6 @@ use crate::message::Message;
 use crate::raft_adapter::raft_event_to_log_event;
 use crate::time::{Duration, VirtualTime};
 
-/// Stable identifier of a virtual node within a single simulation.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct NodeId(pub u32);
 
@@ -20,11 +18,9 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-/// Identifier of a timer local to a node.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct TimerId(pub u64);
 
-/// Availability of a node.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
 pub enum Availability {
     #[default]
@@ -40,7 +36,6 @@ impl Availability {
     }
 }
 
-/// Minimal ping node.
 #[derive(Debug)]
 pub struct PingNode {
     pub id: NodeId,
@@ -117,6 +112,9 @@ impl PingNode {
                     }
                 }
             }
+            EventKind::ClientCommand { .. } => {
+                // PingNode ignores client commands.
+            }
         }
         actions
     }
@@ -128,7 +126,6 @@ impl PingNode {
     }
 }
 
-/// Adapter wrapping `dsfs_raft::RaftNode` for the core engine.
 pub struct RaftAdapter {
     pub id: NodeId,
     pub inner: RaftNode,
@@ -175,6 +172,10 @@ impl RaftAdapter {
                 let out = self.inner.on_message(PeerId(from.0), m.clone());
                 self.output_to_actions(out)
             }
+            EventKind::ClientCommand { command, .. } => {
+                let out = self.inner.on_client_command(command.clone());
+                self.output_to_actions(out)
+            }
         }
     }
 
@@ -200,10 +201,14 @@ impl RaftAdapter {
 }
 
 /// Dispatch enum over node kinds.
+///
+/// `RaftAdapter` is boxed: it is ~10x larger than `PingNode` (Raft state is
+/// big). Boxing keeps `NodeImpl` small regardless of variant, so moving and
+/// storing `PingNode`s does not pay for Raft's footprint. See DD-018.
 #[derive(Debug)]
 pub enum NodeImpl {
     Ping(PingNode),
-    Raft(RaftAdapter),
+    Raft(Box<RaftAdapter>),
 }
 
 impl NodeImpl {
@@ -231,6 +236,30 @@ impl NodeImpl {
         match self {
             NodeImpl::Ping(n) => n.handle(now, event_id, payload),
             NodeImpl::Raft(n) => n.handle(now, event_id, payload),
+        }
+    }
+
+    #[must_use]
+    pub fn raft_leader_id(&self) -> Option<NodeId> {
+        match self {
+            NodeImpl::Raft(a) if a.inner.role() == dsfs_raft::Role::Leader => Some(a.id),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn raft_applied(&self) -> Option<&[Vec<u8>]> {
+        match self {
+            NodeImpl::Raft(a) => Some(a.inner.applied()),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn raft_commit_index(&self) -> Option<u64> {
+        match self {
+            NodeImpl::Raft(a) => Some(a.inner.commit_index()),
+            _ => None,
         }
     }
 }

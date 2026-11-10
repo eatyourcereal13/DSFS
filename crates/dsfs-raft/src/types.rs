@@ -26,9 +26,6 @@ impl std::fmt::Display for Term {
 }
 
 /// Peer identifier within the Raft cluster.
-///
-/// This is `u32` and is the caller's responsibility to map to a
-/// node identity; `dsfs-raft` does not care.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct PeerId(pub u32);
 
@@ -38,9 +35,7 @@ impl std::fmt::Display for PeerId {
     }
 }
 
-/// Current role of a Raft peer. Raft guarantees at most one leader per
-/// term; there may be multiple candidates in the same term in different
-/// partitions, but not multiple leaders.
+/// Current role of a Raft peer.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
 pub enum Role {
     #[default]
@@ -51,9 +46,11 @@ pub enum Role {
 
 /// A single log entry.
 ///
-/// Stage 5 only carries `index` and `term`; `command` is added in Stage 6.
+/// `index` is 1-based, per the Raft paper. `command` is opaque bytes —
+/// Raft does not interpret it; the application decides on semantics.
 #[derive(Clone, Eq, PartialEq, Debug, Default)]
 pub struct LogEntry {
     pub index: u64,
     pub term: Term,
+    pub command: Vec<u8>,
 }

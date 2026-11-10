@@ -33,7 +33,7 @@ fn build_raft_cluster(
         );
         let raft = RaftNode::new(p, peers.clone(), cfg.clone(), Box::new(rng));
         let adapter = RaftAdapter::new(NodeId(p.0), raft);
-        e.add_node(NodeImpl::Raft(adapter)).unwrap();
+        e.add_node(NodeImpl::Raft(Box::new(adapter))).unwrap();
     }
     e
 }

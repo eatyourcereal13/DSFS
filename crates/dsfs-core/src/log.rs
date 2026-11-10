@@ -6,7 +6,6 @@ use crate::event::EventId;
 use crate::node::{Availability, NodeId, TimerId};
 use crate::time::VirtualTime;
 
-/// Kind of entry recorded in the simulation log.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogEventKind {
     MessageSent {
@@ -82,6 +81,35 @@ pub enum LogEventKind {
         node: NodeId,
         from: u64,
         to: u64,
+    },
+
+    RaftAppended {
+        node: NodeId,
+        index: u64,
+        term: u64,
+    },
+    RaftApplied {
+        node: NodeId,
+        index: u64,
+        command: Vec<u8>,
+    },
+    RaftLogTruncated {
+        node: NodeId,
+        from_index: u64,
+    },
+    RaftLogAppended {
+        node: NodeId,
+        from_index: u64,
+        count: u64,
+    },
+    RaftCommitAdvanced {
+        node: NodeId,
+        from: u64,
+        to: u64,
+    },
+    RaftClientCommandRejected {
+        node: NodeId,
+        reason: &'static str,
     },
 }
 

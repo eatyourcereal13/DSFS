@@ -1,10 +1,6 @@
 //! Adapter between `dsfs-core` and `dsfs-raft`.
-//!
-//! The Raft crate is deliberately independent; here we provide the glue:
-//! a `RaftRng` implementation backed by `StreamRng`, and helpers to map
-//! Raft-level events to core-level `LogRecord`s.
 
-use dsfs_raft::{FollowerReason, RaftEvent, RaftRng};
+use dsfs_raft::{FollowerReason, RaftEvent, RaftRng, RejectReason};
 
 use crate::log::LogEventKind;
 use crate::node::NodeId;
@@ -12,14 +8,11 @@ use crate::rng::StreamRng;
 
 impl RaftRng for StreamRng {
     fn gen_range_u64(&mut self, low: u64, high: u64) -> u64 {
-        // Delegate to the inherent method.
         StreamRng::gen_range_u64(self, low, high)
     }
 }
 
 /// Converts a Raft-level event into a core-level `LogEventKind`.
-///
-/// `node` is the id of the Raft peer emitting the event.
 #[must_use]
 pub fn raft_event_to_log_event(node: NodeId, event: &RaftEvent) -> LogEventKind {
     match event {
@@ -52,6 +45,34 @@ pub fn raft_event_to_log_event(node: NodeId, event: &RaftEvent) -> LogEventKind 
             from: from.0,
             to: to.0,
         },
+        RaftEvent::Appended { index, term } => LogEventKind::RaftAppended {
+            node,
+            index: *index,
+            term: term.0,
+        },
+        RaftEvent::Applied { index, command } => LogEventKind::RaftApplied {
+            node,
+            index: *index,
+            command: command.clone(),
+        },
+        RaftEvent::LogTruncated { from_index } => LogEventKind::RaftLogTruncated {
+            node,
+            from_index: *from_index,
+        },
+        RaftEvent::LogAppended { from_index, count } => LogEventKind::RaftLogAppended {
+            node,
+            from_index: *from_index,
+            count: *count,
+        },
+        RaftEvent::CommitAdvanced { from, to } => LogEventKind::RaftCommitAdvanced {
+            node,
+            from: *from,
+            to: *to,
+        },
+        RaftEvent::ClientCommandRejected { reason } => LogEventKind::RaftClientCommandRejected {
+            node,
+            reason: reject_reason_name(reason),
+        },
     }
 }
 
@@ -62,5 +83,11 @@ fn follower_reason_name(r: &FollowerReason) -> &'static str {
         FollowerReason::SameTermLeader => "same_term_leader",
         FollowerReason::SameTermCandidate => "same_term_candidate",
         FollowerReason::Timeout => "timeout",
+    }
+}
+
+fn reject_reason_name(r: &RejectReason) -> &'static str {
+    match r {
+        RejectReason::NotLeader => "not_leader",
     }
 }
