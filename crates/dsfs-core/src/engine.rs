@@ -1,13 +1,12 @@
 //! Simulation engine.
 //!
-//! The engine owns the clock, the event queue, the nodes, the network
-//! model, the log, and the global random streams. It is the only entity
-//! that mutates global state. Nodes are pure state machines returning
-//! `Action`s; the engine is the interpreter.
+//! The engine owns the clock, the event queue, the nodes, the network model
+//! and the log. It is the only entity that mutates global state. Nodes are
+//! pure state machines returning `Action`s; the engine is the interpreter.
 //!
-//! Determinism contract: given the same initial configuration and the
-//! same master seed, the engine must produce an identical sequence of
-//! `LogRecord`s across runs. This is tested in `tests/integration/`.
+//! Determinism contract: given the same initial configuration, the same
+//! master seed and the same `NetworkModel` implementation, the engine must
+//! produce an identical sequence of `LogRecord`s across runs.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -16,63 +15,19 @@ use crate::action::Action;
 use crate::event::{EventId, EventKind, EventPayload, Priority};
 use crate::log::{EventLog, InMemoryLog, LogEventKind, LogRecord};
 use crate::message::Message;
+use crate::network::{NetworkModel, NullNetwork};
 use crate::node::{NodeId, PingNode};
 use crate::scheduler::EventQueue;
 use crate::time::VirtualTime;
 
-/// Network model used by the engine.
-///
-/// Stage 2 ships with [`NullNetwork`] only. Stage 3 will add a full model
-/// with per-link latency, loss, duplication and partitions. The trait
-/// exists now because there are already two concrete futures: null and
-/// full. It is a one-method trait, object-safe, cheap to dispatch.
-pub trait NetworkModel {
-    /// Decides when (in virtual time) a message is delivered.
-    ///
-    /// Returns `None` if the message is dropped. The current time and the
-    /// message endpoints are provided so that latency- or loss-aware
-    /// implementations can make decisions.
-    fn deliver_at(
-        &mut self,
-        now: VirtualTime,
-        from: NodeId,
-        to: NodeId,
-        msg: &Message,
-    ) -> Option<VirtualTime>;
-}
-
-/// Instantaneous, lossless network. Delivers messages at the current
-/// virtual time, never drops.
-///
-/// Used on Stage 2 only to verify the engine loop. The name is deliberate:
-/// it signals that the *absence* of a real network model is a Stage-2
-/// stand-in, not a permanent design choice.
-#[derive(Debug, Default)]
-pub struct NullNetwork;
-
-impl NetworkModel for NullNetwork {
-    fn deliver_at(
-        &mut self,
-        now: VirtualTime,
-        _from: NodeId,
-        _to: NodeId,
-        _msg: &Message,
-    ) -> Option<VirtualTime> {
-        Some(now)
-    }
-}
+pub use crate::network::{Delivery, FullNetwork, LinkConfig};
 
 /// Engine configuration.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
     /// Master seed for all random streams in the simulation.
-    ///
-    /// Stage 2 does not consume randomness, but the seed is threaded
-    /// through so that later stages can create their `StreamRng`s from
-    /// it without changing the engine's public surface.
     pub master_seed: u64,
-    /// Hard cap on the number of events processed; prevents infinite loops
-    /// in scenarios with periodic timers.
+    /// Hard cap on the number of events processed.
     pub max_events: u64,
 }
 
@@ -119,13 +74,28 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         self.clock
     }
 
+    /// Returns a shared reference to the network model.
+    ///
+    /// Useful for tests and tooling that need to inspect link state.
+    #[must_use]
+    pub fn network(&self) -> &N {
+        &self.network
+    }
+
+    /// Returns a mutable reference to the network model.
+    ///
+    /// Fault injection (Stage 7) will use this to reconfigure links
+    /// mid-simulation.
+    pub fn network_mut(&mut self) -> &mut N {
+        &mut self.network
+    }
+
     /// Adds a ping node to the cluster.
     ///
     /// # Errors
     ///
     /// Returns an error if a node with the same id already exists, or if
-    /// the node's `on_start` actions cannot be routed (e.g., the log
-    /// rejects a record).
+    /// the node's `on_start` actions cannot be routed.
     pub fn add_ping_node(&mut self, mut node: PingNode) -> io::Result<()> {
         let id = node.id;
         if self.nodes.contains_key(&id) {
@@ -183,8 +153,6 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         })
     }
 
-    /// Dispatches an event to its target node, routes the resulting actions,
-    /// and logs the delivery when applicable.
     fn dispatch_to_node(
         &mut self,
         payload: EventPayload,
@@ -196,7 +164,6 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             EventKind::MessageDelivered { to, .. } => *to,
         };
 
-        // Log delivery of a network message before the node reacts.
         if let EventKind::MessageDelivered { from, .. } = &payload.kind {
             self.log.record(LogRecord {
                 event_id,
@@ -209,8 +176,6 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             })?;
         }
 
-        // `VirtualTime` is `Copy`; take it by value before the mutable
-        // borrow of `self.nodes` starts, so the borrow ends on this line.
         let now = self.clock;
 
         let actions = {
@@ -223,7 +188,6 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         self.route_actions(node_id, Some(event_id), actions)
     }
 
-    /// Interprets actions returned by a node.
     fn route_actions(
         &mut self,
         source: NodeId,
@@ -281,32 +245,43 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         msg: Message,
         caused_by: Option<EventId>,
     ) -> io::Result<()> {
-        let deliver_at = self.network.deliver_at(self.clock, from, to, &msg);
-        let Some(when) = deliver_at else {
-            return Ok(()); // message dropped by the network model
-        };
-        self.log.record(LogRecord {
-            event_id: caused_by.unwrap_or(EventId(u64::MAX)),
-            time: self.clock,
-            kind: LogEventKind::MessageSent { from, to },
-            caused_by,
-        })?;
-        self.queue.schedule(
-            when,
-            Priority::Network,
-            EventPayload::new(EventKind::MessageDelivered { to, from, msg }, caused_by),
-        );
+        let deliveries = self.network.deliveries(self.clock, from, to, &msg);
+
+        if deliveries.is_empty() {
+            self.log.record(LogRecord {
+                event_id: caused_by.unwrap_or(EventId(u64::MAX)),
+                time: self.clock,
+                kind: LogEventKind::MessageDropped { from, to },
+                caused_by,
+            })?;
+            return Ok(());
+        }
+
+        for d in deliveries {
+            self.log.record(LogRecord {
+                event_id: caused_by.unwrap_or(EventId(u64::MAX)),
+                time: self.clock,
+                kind: if d.is_duplicate {
+                    LogEventKind::MessageDuplicated { from, to }
+                } else {
+                    LogEventKind::MessageSent { from, to }
+                },
+                caused_by,
+            })?;
+            self.queue.schedule(
+                d.at,
+                Priority::Network,
+                EventPayload::new(EventKind::MessageDelivered { to, from, msg }, caused_by),
+            );
+        }
         Ok(())
     }
 }
 
 /// Convenience constructor with in-memory log and null network.
 ///
-/// This is a free function rather than an associated function on
-/// `SimulationEngine` because type inference cannot resolve the generic
-/// parameters of `SimulationEngine` from an associated-function call
-/// without turbofish. As a free function, the return type
-/// `SimulationEngine<InMemoryLog, NullNetwork>` fully determines `L` and `N`.
+/// Free function rather than an associated method because type inference
+/// cannot resolve `SimulationEngine`'s generics from an associated call.
 #[must_use]
 pub fn new_in_memory_engine(config: EngineConfig) -> SimulationEngine<InMemoryLog, NullNetwork> {
     SimulationEngine::new(config, NullNetwork, InMemoryLog::new())
@@ -371,5 +346,39 @@ mod tests {
             .add_ping_node(PingNode::new(NodeId(1), Duration::from_millis(100)))
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn full_network_with_latency_delays_messages() {
+        let cfg = EngineConfig {
+            master_seed: 42,
+            max_events: 100,
+        };
+        let link = LinkConfig::with_latency(Duration::from_millis(50));
+        let net = FullNetwork::new(42, link);
+        let mut e = SimulationEngine::new(cfg, net, InMemoryLog::new());
+        e.add_ping_node(PingNode::new(NodeId(1), Duration::from_millis(10)))
+            .unwrap();
+        e.add_ping_node(PingNode::new(NodeId(2), Duration::from_millis(10)))
+            .unwrap();
+        e.run().unwrap();
+        let log = e.into_log();
+        // With 50 ms latency and 10 ms ping interval, deliveries lag behind sends.
+        let first_send = log
+            .records()
+            .iter()
+            .find(|r| matches!(r.kind, LogEventKind::MessageSent { .. }))
+            .expect("expected a sent message");
+        let first_delivery = log
+            .records()
+            .iter()
+            .find(|r| matches!(r.kind, LogEventKind::MessageDelivered { .. }))
+            .expect("expected a delivered message");
+        assert!(
+            first_delivery.time.0 > first_send.time.0,
+            "delivery at {:?} must be after send at {:?}",
+            first_delivery.time,
+            first_send.time
+        );
     }
 }

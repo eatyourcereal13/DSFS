@@ -1,9 +1,15 @@
 //! Core primitives for the Distributed Systems Failure Simulator.
 //!
-//! Stage 2 adds the deterministic engine loop, `Action`-based node
-//! interaction, in-memory event log, and a trivial network model used to
-//! exercise the loop with `PingNode`s. Raft, real network, and fault
-//! injection come in later stages.
+//! - [`time`] — `VirtualTime`, `Duration`.
+//! - [`event`] — event keys, priorities, payloads.
+//! - [`scheduler`] — deterministic `EventQueue`.
+//! - [`rng`] — stream-partitioned deterministic RNG.
+//! - [`network`] — `NetworkModel`, `FullNetwork`, `LinkConfig`.
+//! - [`node`] — `NodeId`, `PingNode`.
+//! - [`message`] — `Message`.
+//! - [`action`] — `Action` returned by nodes.
+//! - [`log`] — `EventLog`, `LogRecord`.
+//! - [`engine`] — `SimulationEngine`.
 
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
@@ -13,6 +19,7 @@ pub mod engine;
 pub mod event;
 pub mod log;
 pub mod message;
+pub mod network;
 pub mod node;
 pub mod rng;
 pub mod scheduler;
