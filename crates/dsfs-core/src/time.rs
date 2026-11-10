@@ -4,6 +4,7 @@
 //! count of nanoseconds since simulation start. The simulation must never
 //! consult the real system clock (see `docs/design-decisions.md`, DD-001).
 
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::Add;
 
@@ -12,7 +13,9 @@ use std::ops::Add;
 /// Using `u64` nanoseconds gives a range of about 584 years. `saturating_add`
 /// must be used when adding durations; overflow indicates a bug in the
 /// scenario, not a runtime condition.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+#[derive(
+    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Serialize, Deserialize,
+)]
 pub struct VirtualTime(pub u64);
 
 impl VirtualTime {
@@ -66,7 +69,9 @@ impl fmt::Display for VirtualTime {
 ///
 /// This mirrors `std::time::Duration` but lives in the virtual domain, so a
 /// real duration can never be accidentally added to a virtual time.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+#[derive(
+    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Serialize, Deserialize,
+)]
 pub struct Duration(pub u64);
 
 impl Duration {

@@ -12,14 +12,13 @@ impl RaftRng for StreamRng {
     }
 }
 
-/// Converts a Raft-level event into a core-level `LogEventKind`.
 #[must_use]
 pub fn raft_event_to_log_event(node: NodeId, event: &RaftEvent) -> LogEventKind {
     match event {
         RaftEvent::BecameFollower { term, reason } => LogEventKind::RaftBecameFollower {
             node,
             term: term.0,
-            reason: follower_reason_name(reason),
+            reason: follower_reason_name(reason).to_string(),
         },
         RaftEvent::BecameCandidate { term } => {
             LogEventKind::RaftBecameCandidate { node, term: term.0 }
@@ -50,6 +49,11 @@ pub fn raft_event_to_log_event(node: NodeId, event: &RaftEvent) -> LogEventKind 
             index: *index,
             term: term.0,
         },
+        RaftEvent::EntryAppended { index, term } => LogEventKind::RaftEntryAppended {
+            node,
+            index: *index,
+            term: term.0,
+        },
         RaftEvent::Applied { index, command } => LogEventKind::RaftApplied {
             node,
             index: *index,
@@ -59,11 +63,6 @@ pub fn raft_event_to_log_event(node: NodeId, event: &RaftEvent) -> LogEventKind 
             node,
             from_index: *from_index,
         },
-        RaftEvent::LogAppended { from_index, count } => LogEventKind::RaftLogAppended {
-            node,
-            from_index: *from_index,
-            count: *count,
-        },
         RaftEvent::CommitAdvanced { from, to } => LogEventKind::RaftCommitAdvanced {
             node,
             from: *from,
@@ -71,7 +70,7 @@ pub fn raft_event_to_log_event(node: NodeId, event: &RaftEvent) -> LogEventKind 
         },
         RaftEvent::ClientCommandRejected { reason } => LogEventKind::RaftClientCommandRejected {
             node,
-            reason: reject_reason_name(reason),
+            reason: reject_reason_name(reason).to_string(),
         },
     }
 }

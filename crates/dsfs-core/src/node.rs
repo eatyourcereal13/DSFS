@@ -8,8 +8,9 @@ use crate::log::LogEventKind;
 use crate::message::Message;
 use crate::raft_adapter::raft_event_to_log_event;
 use crate::time::{Duration, VirtualTime};
+use serde::{Deserialize, Serialize};
 
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Serialize, Deserialize)]
 pub struct NodeId(pub u32);
 
 impl std::fmt::Display for NodeId {
@@ -18,10 +19,12 @@ impl std::fmt::Display for NodeId {
     }
 }
 
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Serialize, Deserialize)]
 pub struct TimerId(pub u64);
 
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+#[derive(
+    Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default, Serialize, Deserialize,
+)]
 pub enum Availability {
     #[default]
     Online,

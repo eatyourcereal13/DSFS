@@ -1,6 +1,7 @@
 //! Event identifiers, priorities and keys.
 
 use crate::time::VirtualTime;
+use serde::{Deserialize, Serialize};
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct EventSeq(pub u64);
@@ -40,7 +41,7 @@ impl EventKey {
 }
 
 /// Identifier of an event as it is being processed.
-#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Serialize, Deserialize)]
 pub struct EventId(pub u64);
 
 impl std::fmt::Display for EventId {

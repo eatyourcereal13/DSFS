@@ -42,6 +42,11 @@ pub enum RaftEvent {
         index: u64,
         term: Term,
     },
+    /// An entry was appended to the follower's log from the leader.
+    EntryAppended {
+        index: u64,
+        term: Term,
+    },
     /// An entry was committed and applied to the state machine.
     Applied {
         index: u64,
@@ -50,11 +55,6 @@ pub enum RaftEvent {
     /// A follower truncated its log (conflict resolution).
     LogTruncated {
         from_index: u64,
-    },
-    /// A follower appended entries from the leader.
-    LogAppended {
-        from_index: u64,
-        count: u64,
     },
     /// The leader committed a new index.
     CommitAdvanced {
@@ -387,10 +387,8 @@ impl RaftNode {
         let last_log_index = self.last_log_index();
         self.state = new_leader_state(&self.peers, last_log_index);
         out.events.push(RaftEvent::BecameLeader { term });
-        // Send initial heartbeats immediately to establish authority.
         self.broadcast_append_entries(out);
         self.arm_heartbeat_timer(out);
-        // For a single-node cluster, immediately commit anything in the log.
         self.maybe_advance_commit(out);
     }
 
@@ -410,21 +408,14 @@ impl RaftNode {
     }
 
     fn send_append_entries_to(&mut self, peer: PeerId, out: &mut RaftOutput) {
-        let (next_index, _) = match &self.state {
-            PeerState::Leader {
-                next_index,
-                match_index,
-            } => (
-                *next_index.get(&peer).unwrap_or(&1),
-                *match_index.get(&peer).unwrap_or(&0),
-            ),
+        let next_index = match &self.state {
+            PeerState::Leader { next_index, .. } => *next_index.get(&peer).unwrap_or(&1),
             _ => return,
         };
         let prev_log_index = next_index.saturating_sub(1);
         let prev_log_term = self.term_at(prev_log_index);
 
-        // Gather entries from next_index to min(last_log_index, next_index + MAX - 1).
-        let start_pos = (next_index.saturating_sub(1)) as usize; // Vec index
+        let start_pos = (next_index.saturating_sub(1)) as usize;
         let end_pos = self.log.len().min(start_pos + MAX_ENTRIES_PER_APPEND);
         let entries: Vec<LogEntry> = self.log[start_pos..end_pos].to_vec();
 
@@ -461,7 +452,7 @@ impl RaftNode {
             return;
         }
         let mut match_indexes: Vec<u64> = Vec::with_capacity(self.peers.len());
-        match_indexes.push(self.last_log_index()); // self
+        match_indexes.push(self.last_log_index());
         if let PeerState::Leader { match_index, .. } = &self.state {
             for &p in &self.peers {
                 if p == self.self_id {
@@ -471,7 +462,6 @@ impl RaftNode {
             }
         }
         match_indexes.sort_unstable();
-        // Majority = peers.len()/2 + 1; find the majority-th largest.
         let majority = self.peers.len() / 2 + 1;
         if match_indexes.len() < majority {
             return;
@@ -641,8 +631,7 @@ impl RaftNode {
             return out;
         }
 
-        // Append / truncate.
-        let mut append_from: Option<u64> = None;
+        // Append / truncate. Emit EntryAppended per entry (not per range).
         for (i, e) in entries.iter().enumerate() {
             let idx = prev_log_index + 1 + i as u64;
             match self.log_at(idx) {
@@ -650,28 +639,22 @@ impl RaftNode {
                     // Already present, skip.
                 }
                 Some(_) => {
-                    // Conflict: truncate at idx-1 and append.
                     self.log.truncate((idx - 1) as usize);
                     out.events.push(RaftEvent::LogTruncated { from_index: idx });
                     self.log.push(e.clone());
-                    if append_from.is_none() {
-                        append_from = Some(idx);
-                    }
+                    out.events.push(RaftEvent::EntryAppended {
+                        index: idx,
+                        term: e.term,
+                    });
                 }
                 None => {
                     self.log.push(e.clone());
-                    if append_from.is_none() {
-                        append_from = Some(idx);
-                    }
+                    out.events.push(RaftEvent::EntryAppended {
+                        index: idx,
+                        term: e.term,
+                    });
                 }
             }
-        }
-        if let Some(from_idx) = append_from {
-            let count = self.last_log_index() - from_idx + 1;
-            out.events.push(RaftEvent::LogAppended {
-                from_index: from_idx,
-                count,
-            });
         }
 
         // Advance commit.
@@ -742,9 +725,6 @@ impl RaftNode {
 
 #[cfg(test)]
 mod tests {
-    // Tests are extensive; kept minimal here to reduce churn.
-    // Full replication tests live in `crates/dsfs-core/tests/raft_replication.rs`.
-
     use super::*;
     use crate::rng::fixed::CyclicRng;
 
@@ -764,7 +744,7 @@ mod tests {
     fn single_node_commits_on_append() {
         let mut n = node(1, vec![1], vec![0, 0]);
         let _ = n.on_start();
-        let _ = n.on_timer(1); // become leader
+        let _ = n.on_timer(1);
         assert_eq!(n.role(), Role::Leader);
         let out = n.on_client_command(b"hello".to_vec());
         assert!(out
@@ -796,5 +776,42 @@ mod tests {
         assert_eq!(n.log().len(), 1);
         assert_eq!(n.log()[0].index, 1);
         assert_eq!(n.log()[0].command, b"a");
+    }
+
+    #[test]
+    fn follower_emits_entry_appended_per_entry() {
+        // Follower receives AppendEntries with 2 entries, must emit 2
+        // EntryAppended events.
+        let mut n = node(2, vec![1, 2, 3], vec![0, 0]);
+        let _ = n.on_start();
+        let entries = vec![
+            LogEntry {
+                index: 1,
+                term: Term(1),
+                command: b"a".to_vec(),
+            },
+            LogEntry {
+                index: 2,
+                term: Term(1),
+                command: b"b".to_vec(),
+            },
+        ];
+        let out = n.on_message(
+            PeerId(1),
+            RaftMessage::AppendEntries {
+                term: Term(1),
+                leader_id: PeerId(1),
+                prev_log_index: 0,
+                prev_log_term: Term::ZERO,
+                entries,
+                leader_commit: 0,
+            },
+        );
+        let appended: Vec<_> = out
+            .events
+            .iter()
+            .filter(|e| matches!(e, RaftEvent::EntryAppended { .. }))
+            .collect();
+        assert_eq!(appended.len(), 2);
     }
 }

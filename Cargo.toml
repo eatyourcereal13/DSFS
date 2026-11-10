@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/dsfs-core",
     "crates/dsfs-raft",
+    "crates/dsfs-checker",
 ]
 
 [workspace.package]
@@ -18,8 +19,11 @@ thiserror = "1.0"
 rand = "0.8"
 rand_chacha = "0.3"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 serde_yaml = "0.9"
 dsfs-raft = { path = "crates/dsfs-raft" }
+dsfs-checker = { path = "crates/dsfs-checker" }
+dsfs-core = { path = "crates/dsfs-core" }
 
 [profile.release]
 lto = "thin"
