@@ -1,0 +1,29 @@
+version: 1
+name: node_recovery
+seed: 42
+cluster:
+  nodes: 5
+  raft:
+    election_timeout_ms: 150
+    heartbeat_interval_ms: 30
+network:
+  default:
+    base_latency_ms: 5
+    jitter_ms: 2
+    loss_probability: 0.0
+    duplicate_probability: 0.0
+events:
+  - wait_for_leader: {}
+  - at_ms: 1000
+    crash_node: 4
+  - at_ms: 2000
+    submit_write:
+      key: before_recovery
+      value: "1"
+  - at_ms: 5000
+    restart_node: 4
+  - wait_for_leader: {}
+  - at_ms: 6000
+    submit_write:
+      key: after_recovery
+      value: "2"

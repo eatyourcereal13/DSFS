@@ -111,6 +111,10 @@ pub enum LogEventKind {
         node: NodeId,
         reason: &'static str,
     },
+    FaultApplied {
+        index: usize,
+        description: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

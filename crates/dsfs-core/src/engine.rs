@@ -5,10 +5,12 @@ use std::io;
 
 use crate::action::Action;
 use crate::event::{EventId, EventKind, EventPayload, Priority};
+use crate::fault_injector::{FaultInjector, InjectionOutcome};
 use crate::log::{EventLog, InMemoryLog, LogEventKind, LogRecord};
 use crate::message::Message;
 use crate::network::{NetworkModel, NullNetwork};
 use crate::node::{Availability, NodeId, NodeImpl, PingNode};
+use crate::scenario::Scenario;
 use crate::scheduler::EventQueue;
 use crate::time::{Duration, VirtualTime};
 
@@ -52,6 +54,7 @@ pub struct SimulationEngine<L: EventLog, N: NetworkModel> {
     log: L,
     next_event_id: u64,
     processed_events: u64,
+    fault_injector: Option<FaultInjector>,
 }
 
 impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
@@ -67,6 +70,7 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             log,
             next_event_id: 0,
             processed_events: 0,
+            fault_injector: None,
         }
     }
 
@@ -85,6 +89,19 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
     /// Mutable reference to the network model.
     pub fn network_mut(&mut self) -> &mut N {
         &mut self.network
+    }
+
+    /// Attaches a fault injector.
+    #[must_use]
+    pub fn with_fault_injector(mut self, injector: FaultInjector) -> Self {
+        self.fault_injector = Some(injector);
+        self
+    }
+
+    /// Convenience: attach injector from a scenario.
+    #[must_use]
+    pub fn with_scenario(self, scenario: &Scenario) -> Self {
+        self.with_fault_injector(FaultInjector::from_scenario(scenario))
     }
 
     /// Adds a ping node to the cluster.
@@ -261,26 +278,29 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
     /// Runs the engine until the queue is empty or `budget` more events
     /// have been processed.
     ///
-    /// Use this for interactive control:
-    ///
-    /// ```ignore
-    /// e.run_until(10_000)?;    // let elections settle
-    /// e.submit_command(...)?;
-    /// e.run_until(5_000)?;     // let the command replicate and commit
-    /// ```
+    /// Fault-injection events (if an injector is attached) are fired when
+    /// their `at_ms` is reached relative to the current virtual time.
     ///
     /// # Errors
     ///
-    /// Propagates I/O errors from the event log.
+    /// Propagates I/O errors from the event log or from fault outcomes.
     pub fn run_until(&mut self, budget: u64) -> io::Result<RunOutcome> {
         let target = self.processed_events.saturating_add(budget);
+        self.pump_fault_injector()?;
+
         while self.processed_events < target {
+            self.pump_fault_injector()?;
+
             let Some(event) = self.queue.pop() else {
+                self.pump_fault_injector()?;
                 return Ok(RunOutcome::Completed {
                     processed: self.processed_events,
                 });
             };
+
             self.clock = event.key.time;
+            self.pump_fault_injector()?;
+
             let event_id = EventId(self.next_event_id);
             self.next_event_id += 1;
             self.processed_events += 1;
@@ -292,6 +312,61 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         Ok(RunOutcome::HitEventLimit {
             processed: self.processed_events,
         })
+    }
+
+    fn pump_fault_injector(&mut self) -> io::Result<()> {
+        loop {
+            if self.fault_injector.is_none() {
+                return Ok(());
+            }
+            let leader_exists = self.find_leader().is_some();
+            let now = self.clock;
+
+            // Scope the mutable borrow of `fault_injector` to a single
+            // `try_fire` call; the returned outcome is owned, so the
+            // borrow ends immediately after this block.
+            let fired = {
+                let injector = self.fault_injector.as_mut().expect("checked is_none above");
+                injector.try_fire(now, leader_exists)
+            };
+
+            let Some((index, outcome)) = fired else {
+                return Ok(());
+            };
+
+            let description = format_outcome(&outcome);
+            self.log.record(LogRecord {
+                event_id: EventId(u64::MAX),
+                time: self.clock,
+                kind: LogEventKind::FaultApplied { index, description },
+                caused_by: None,
+            })?;
+
+            match outcome {
+                InjectionOutcome::WaitSatisfied => {}
+                InjectionOutcome::Crash(id) => {
+                    self.set_availability(id, Availability::Offline)?;
+                }
+                InjectionOutcome::Restart(id) => {
+                    self.set_availability(id, Availability::Online)?;
+                }
+                InjectionOutcome::Partition { group_a, group_b } => {
+                    self.network_mut().partition_groups(&group_a, &group_b);
+                }
+                InjectionOutcome::Heal { group_a, group_b } => {
+                    self.network_mut().heal_groups(&group_a, &group_b);
+                }
+                InjectionOutcome::SetSlow { node, factor } => {
+                    self.set_slow_factor(node, factor)?;
+                }
+                InjectionOutcome::ClearSlow(node) => {
+                    self.set_slow_factor(node, 1.0)?;
+                }
+                InjectionOutcome::Submit { command } => {
+                    let _ = self.submit_command(command);
+                }
+            }
+        }
     }
 
     fn dispatch_to_node(
@@ -318,7 +393,6 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             return self.handle_offline_dispatch(node_id, event_id, caused_by, &payload);
         }
 
-        // Log delivery of a network message before the node reacts.
         if let EventKind::MessageDelivered { from, .. } = &payload.kind {
             self.log.record(LogRecord {
                 event_id,
@@ -489,6 +563,23 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             );
         }
         Ok(())
+    }
+}
+
+fn format_outcome(o: &InjectionOutcome) -> String {
+    match o {
+        InjectionOutcome::WaitSatisfied => "wait_for_leader satisfied".to_string(),
+        InjectionOutcome::Crash(n) => format!("crash {n}"),
+        InjectionOutcome::Restart(n) => format!("restart {n}"),
+        InjectionOutcome::Partition { group_a, group_b } => {
+            format!("partition {group_a:?} | {group_b:?}")
+        }
+        InjectionOutcome::Heal { group_a, group_b } => {
+            format!("heal {group_a:?} | {group_b:?}")
+        }
+        InjectionOutcome::SetSlow { node, factor } => format!("set_slow {node} = {factor}"),
+        InjectionOutcome::ClearSlow(n) => format!("clear_slow {n}"),
+        InjectionOutcome::Submit { command } => format!("submit ({} bytes)", command.len()),
     }
 }
 

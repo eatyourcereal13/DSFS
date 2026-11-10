@@ -1,14 +1,6 @@
 //! Network simulation.
 //!
-//! [`NetworkModel`] is the engine-facing interface. [`NullNetwork`] is a
-//! trivial stand-in (instant, lossless). [`FullNetwork`] implements per-link
-//! latency, jitter, loss, duplication and partitions.
-//!
-//! Reordering emerges naturally from jitter: when `jitter >= base_latency`,
-//! consecutive messages on the same link can arrive out of order. We do not
-//! model reordering as an explicit operation because that would require
-//! buffering and shuffling at the engine level, which conflicts with the
-//! replay guarantee. See DD-009 in `docs/design-decisions.md`.
+//! See DD-006..DD-009 and DD-021 in `docs/design-decisions.md`.
 
 use std::collections::HashMap;
 
@@ -18,10 +10,6 @@ use crate::rng::{StreamId, StreamRng};
 use crate::time::{Duration, VirtualTime};
 
 /// A single delivery decision produced by a [`NetworkModel`].
-///
-/// A message may yield zero (dropped), one (normal), or several
-/// (`duplicate_probability` > 0) deliveries. Each delivery carries the
-/// virtual time at which it should occur and whether it is a duplicate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Delivery {
     pub at: VirtualTime,
@@ -45,6 +33,17 @@ pub trait NetworkModel {
         to: NodeId,
         msg: &Message,
     ) -> Vec<Delivery>;
+
+    /// Partitions two groups from each other (all cross-links cut).
+    ///
+    /// Default implementation does nothing; implementors that support
+    /// partitions (e.g. [`FullNetwork`]) must override.
+    fn partition_groups(&mut self, _a: &[NodeId], _b: &[NodeId]) {}
+
+    /// Heals all cross-links between two groups.
+    ///
+    /// Default implementation does nothing.
+    fn heal_groups(&mut self, _a: &[NodeId], _b: &[NodeId]) {}
 }
 
 /// Instantaneous, lossless network. Always delivers exactly once, now.
@@ -69,16 +68,10 @@ impl NetworkModel for NullNetwork {
 /// Per-direction link parameters.
 #[derive(Clone, Debug)]
 pub struct LinkConfig {
-    /// Minimal one-way delay.
     pub base_latency: Duration,
-    /// Maximum extra random delay added on top of `base_latency`.
     pub jitter: Duration,
-    /// Probability of dropping a message, in `[0.0, 1.0]`.
     pub loss_probability: f64,
-    /// Probability of delivering the message an extra time, in `[0.0, 1.0]`.
     pub duplicate_probability: f64,
-    /// When `true`, all messages on this link are dropped regardless of
-    /// `loss_probability`.
     pub partitioned: bool,
 }
 
@@ -127,15 +120,8 @@ impl Default for LinkConfig {
 /// Full network model.
 ///
 /// Random decisions use per-purpose streams (`NETWORK_LATENCY`,
-/// `NETWORK_LOSS`, `NETWORK_DUPLICATE`). Within each stream, draws happen in
-/// the order dictated by the engine's `deliveries()` calls, which is
-/// deterministic.
-///
-/// Important ordering guarantee (DD-007): when a message is dropped, the
-/// latency RNG is **not** consumed. This keeps the latency stream's index
-/// aligned with the number of *delivered* messages, not the number of
-/// *attempted* messages. Without this, the presence of loss on one link
-/// would shift the latency sequence for all other links.
+/// `NETWORK_LOSS`, `NETWORK_DUPLICATE`). When a message is dropped, the
+/// latency RNG is not consumed (DD-007).
 pub struct FullNetwork {
     default_link: LinkConfig,
     overrides: HashMap<(NodeId, NodeId), LinkConfig>,
@@ -190,25 +176,6 @@ impl FullNetwork {
         self.link_mut(a, b).partitioned = false;
         self.link_mut(b, a).partitioned = false;
     }
-
-    /// Partitions the cluster into two groups. Links within a group are
-    /// untouched; links across groups are cut in both directions.
-    pub fn partition_groups(&mut self, group_a: &[NodeId], group_b: &[NodeId]) {
-        for &a in group_a {
-            for &b in group_b {
-                self.partition(a, b);
-            }
-        }
-    }
-
-    /// Restores all links between two groups.
-    pub fn heal_groups(&mut self, group_a: &[NodeId], group_b: &[NodeId]) {
-        for &a in group_a {
-            for &b in group_b {
-                self.heal(a, b);
-            }
-        }
-    }
 }
 
 impl NetworkModel for FullNetwork {
@@ -229,8 +196,6 @@ impl NetworkModel for FullNetwork {
             return Vec::new();
         }
 
-        // Loss decision first (see DD-007). If dropped, we must not consume
-        // the latency RNG.
         if cfg.loss_probability > 0.0 && self.loss_rng.next_f64() < cfg.loss_probability {
             return Vec::new();
         }
@@ -244,9 +209,6 @@ impl NetworkModel for FullNetwork {
         };
         let delay_ns = base_ns.saturating_add(extra_ns);
 
-        // Duplicate decision. We always draw (even at probability 0) so the
-        // stream's index is deterministic per delivery attempt; this matters
-        // if someone later flips `duplicate_probability` at runtime.
         let dup = self.dup_rng.next_f64() < cfg.duplicate_probability;
 
         let first_at = now + Duration::from_nanos(delay_ns);
@@ -256,16 +218,28 @@ impl NetworkModel for FullNetwork {
             is_duplicate: false,
         });
         if dup {
-            // Duplicate arrives at the same time as the original. This is a
-            // deliberate simplification; Raft must be idempotent anyway, and
-            // a delayed duplicate would require its own latency draw, which
-            // would complicate the per-link latency stream. See DD-006.
             out.push(Delivery {
                 at: first_at,
                 is_duplicate: true,
             });
         }
         out
+    }
+
+    fn partition_groups(&mut self, a: &[NodeId], b: &[NodeId]) {
+        for &x in a {
+            for &y in b {
+                self.partition(x, y);
+            }
+        }
+    }
+
+    fn heal_groups(&mut self, a: &[NodeId], b: &[NodeId]) {
+        for &x in a {
+            for &y in b {
+                self.heal(x, y);
+            }
+        }
     }
 }
 
@@ -391,7 +365,7 @@ mod tests {
         let mut net = FullNetwork::new(42, LinkConfig::perfect());
         let group_a = [n(1), n(2)];
         let group_b = [n(3), n(4), n(5)];
-        net.partition_groups(&group_a, &group_b);
+        NetworkModel::partition_groups(&mut net, &group_a, &group_b);
         for &a in &group_a {
             for &b in &group_b {
                 assert!(net
@@ -408,7 +382,7 @@ mod tests {
         assert!(!net
             .deliveries(VirtualTime::ZERO, n(3), n(4), &Message::Ping)
             .is_empty());
-        net.heal_groups(&group_a, &group_b);
+        NetworkModel::heal_groups(&mut net, &group_a, &group_b);
         assert!(!net
             .deliveries(VirtualTime::ZERO, n(1), n(3), &Message::Ping)
             .is_empty());
@@ -452,9 +426,6 @@ mod tests {
         assert_ne!(run(1), run(2));
     }
 
-    /// DD-007: loss does not consume the latency RNG. So the latency
-    /// sequence for a *lossless* run must match the latency sequence of a
-    /// *lossy* run on the same seed, restricted to non-dropped messages.
     #[test]
     fn loss_does_not_perturb_latency_stream() {
         let jitter_only = {

@@ -17,6 +17,8 @@ authors = ["DSFS Authors"]
 thiserror = "1.0"
 rand = "0.8"
 rand_chacha = "0.3"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
 dsfs-raft = { path = "crates/dsfs-raft" }
 
 [profile.release]

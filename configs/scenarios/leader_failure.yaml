@@ -1,0 +1,23 @@
+version: 1
+name: leader_failure
+seed: 42
+cluster:
+  nodes: 5
+  raft:
+    election_timeout_ms: 150
+    heartbeat_interval_ms: 30
+network:
+  default:
+    base_latency_ms: 5
+    jitter_ms: 2
+    loss_probability: 0.0
+    duplicate_probability: 0.0
+events:
+  - wait_for_leader: {}
+  - at_ms: 1000
+    crash_node: 3
+  - wait_for_leader: {}
+  - at_ms: 3000
+    submit_write:
+      key: balance
+      value: "500"
