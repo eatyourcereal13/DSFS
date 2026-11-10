@@ -1,12 +1,9 @@
 //! In-memory event log.
-//!
-//! `EventLog` is a trait so that JSONL persistence can be added later
-//! without changing the engine. `InMemoryLog` is the default sink.
 
 use std::io;
 
 use crate::event::EventId;
-use crate::node::{NodeId, TimerId};
+use crate::node::{Availability, NodeId, TimerId};
 use crate::time::VirtualTime;
 
 /// Kind of entry recorded in the simulation log.
@@ -26,6 +23,17 @@ pub enum LogEventKind {
     PingReceived { node: NodeId, from: NodeId },
     /// A node received a `Pong`.
     PongReceived { node: NodeId, from: NodeId },
+    /// A node's availability changed.
+    NodeAvailabilityChanged { node: NodeId, to: Availability },
+    /// A node's slow factor changed.
+    NodeSlowFactorChanged {
+        node: NodeId,
+        slow_factor_x1000: u32,
+    },
+    /// An event for an offline node was ignored by the engine.
+    NodeIgnoredWhileOffline { node: NodeId, event_id: EventId },
+    /// A message delivery was delayed because the recipient is slow.
+    MessageDelayedBySlowNode { from: NodeId, to: NodeId },
 }
 
 /// One entry in the simulation log.

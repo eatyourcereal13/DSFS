@@ -1,15 +1,13 @@
-//! Virtual node identifiers and the minimal node state for Stage 2.
+//! Virtual node identifiers, availability states, and the `NodeImpl`
+//! dispatch enum.
 //!
-//! The trait/struct split here is deliberately *not* an abstraction yet:
-//! Stage 2 has exactly one node kind (`PingNode`). When Raft arrives in
-//! Stage 5, an `enum NodeImpl { Ping(PingNode), Raft(RaftNode) }` will be
-//! introduced (see docs/design-decisions.md DD-008, to be written then).
-//! We do not pre-abstract with `dyn Trait` because there is no second
-//! implementor yet — and that would violate the "abstraction after the
-//! second consumer" rule.
+//! The `NodeImpl` enum exists so the engine can hold heterogeneous node
+//! kinds (`PingNode` now, `RaftNode` in Stage 5) without `Box<dyn Node>`
+//! overhead. See DD-010 in `docs/design-decisions.md`.
 
 use crate::action::Action;
 use crate::event::{EventId, EventKind, EventPayload};
+use crate::log::LogEventKind;
 use crate::message::Message;
 use crate::time::{Duration, VirtualTime};
 
@@ -24,26 +22,41 @@ impl std::fmt::Display for NodeId {
 }
 
 /// Identifier of a timer local to a node.
-///
-/// Uniqueness is only required within a single node; the engine pairs
-/// `(node, timer_id)` when dispatching.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct TimerId(pub u64);
 
-/// Minimal node used to exercise the engine loop before Raft exists.
+/// Availability of a node, orthogonal to its protocol role.
 ///
-/// Behaviour: on start, arm a timer for `ping_interval`. On timer fire,
-/// send a `Ping` to every other node and re-arm. On `Ping` received,
-/// reply with `Pong`. On `Pong`, log it.
+/// - `Online`: normal operation.
+/// - `Offline`: does not process any event (message or timer). The engine
+///   drops deliveries and ignores timer expirations for offline nodes.
+/// - `Recovering`: reserved for Stage 7; the engine treats it identically
+///   to `Online` for now.
 ///
-/// No randomness, no real time, no I/O — hence fully deterministic.
+/// Role (`Follower` / `Candidate` / `Leader`) is a Raft concept and lives
+/// inside `RaftNode` (Stage 5), not here.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
+pub enum Availability {
+    #[default]
+    Online,
+    Offline,
+    Recovering,
+}
+
+impl Availability {
+    /// Returns `true` if the node processes events in this state.
+    #[must_use]
+    pub fn is_active(self) -> bool {
+        matches!(self, Availability::Online | Availability::Recovering)
+    }
+}
+
+/// Minimal ping node used to exercise the engine.
 #[derive(Debug)]
 pub struct PingNode {
     pub id: NodeId,
     pub ping_interval: Duration,
-    pub next_timer_id: u64,
-    /// Set to `true` once the initial timer is armed, to avoid doing it
-    /// more than once if the node is somehow reconstructed.
+    next_timer_id: u64,
     initialised: bool,
 }
 
@@ -59,11 +72,7 @@ impl PingNode {
         }
     }
 
-    /// Emits the "start" actions: arm the initial ping timer.
-    ///
-    /// Called by the engine exactly once, when the node is added. This is
-    /// not part of `handle` because "node just appeared" is not an event
-    /// from the scheduler's point of view; it is a lifecycle hook.
+    /// Emits start actions (arm the initial timer) exactly once.
     pub fn on_start(&mut self) -> Vec<Action> {
         if self.initialised {
             return Vec::new();
@@ -76,29 +85,21 @@ impl PingNode {
         }]
     }
 
-    /// Handles a single event, returning the actions to perform.
-    ///
-    /// Note: this method does not mutate any node other than `self`, does
-    /// not touch the network, and does not read the wall clock. It only
-    /// maps `(now, event) -> Vec<Action>`.
+    /// Handles a single event.
     pub fn handle(
         &mut self,
         _now: VirtualTime,
-        event_id: EventId,
+        _event_id: EventId,
         payload: &EventPayload,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         match &payload.kind {
             EventKind::TimerFired { node, timer_id } => {
                 debug_assert_eq!(*node, self.id, "engine dispatched timer to wrong node");
-                actions.push(Action::Log(crate::log::LogEventKind::TimerFired {
+                actions.push(Action::Log(LogEventKind::TimerFired {
                     node: self.id,
                     timer_id: *timer_id,
                 }));
-                // Send Ping to every other node. On Stage 2 the peer list is
-                // passed in via `broadcast_peers`. We keep `PingNode` simple
-                // and let the engine provide the peer set as a field on the
-                // action. See engine.rs `route_actions`.
                 let tid = self.alloc_timer_id();
                 actions.push(Action::ScheduleTimer {
                     delay: self.ping_interval,
@@ -110,7 +111,7 @@ impl PingNode {
                 debug_assert_eq!(*to, self.id, "engine dispatched message to wrong node");
                 match msg {
                     Message::Ping => {
-                        actions.push(Action::Log(crate::log::LogEventKind::PingReceived {
+                        actions.push(Action::Log(LogEventKind::PingReceived {
                             node: self.id,
                             from: *from,
                         }));
@@ -120,7 +121,7 @@ impl PingNode {
                         });
                     }
                     Message::Pong => {
-                        actions.push(Action::Log(crate::log::LogEventKind::PongReceived {
+                        actions.push(Action::Log(LogEventKind::PongReceived {
                             node: self.id,
                             from: *from,
                         }));
@@ -128,7 +129,6 @@ impl PingNode {
                 }
             }
         }
-        let _ = event_id; // preserved for future use in causal logging
         actions
     }
 
@@ -136,6 +136,44 @@ impl PingNode {
         let id = TimerId(self.next_timer_id);
         self.next_timer_id += 1;
         id
+    }
+}
+
+/// Dispatch enum over node kinds.
+///
+/// Adding a new kind (e.g., `Raft`) is a matter of adding a variant and a
+/// match arm; the compiler forces every call site to handle it.
+#[derive(Debug)]
+pub enum NodeImpl {
+    Ping(PingNode),
+}
+
+impl NodeImpl {
+    /// Returns the node's `NodeId`.
+    #[must_use]
+    pub fn id(&self) -> NodeId {
+        match self {
+            NodeImpl::Ping(n) => n.id,
+        }
+    }
+
+    /// Emits start actions (called once, when the node is added).
+    pub fn on_start(&mut self) -> Vec<Action> {
+        match self {
+            NodeImpl::Ping(n) => n.on_start(),
+        }
+    }
+
+    /// Handles one event.
+    pub fn handle(
+        &mut self,
+        now: VirtualTime,
+        event_id: EventId,
+        payload: &EventPayload,
+    ) -> Vec<Action> {
+        match self {
+            NodeImpl::Ping(n) => n.handle(now, event_id, payload),
+        }
     }
 }
 
@@ -183,8 +221,23 @@ mod tests {
             None,
         );
         let actions = n.handle(VirtualTime(0), EventId(0), &ev);
-        assert!(actions.iter().any(
-            |a| matches!(a, Action::SendMessage { to, msg: Message::Pong } if *to == NodeId(2))
-        ));
+        assert!(actions.iter().any(|a| {
+            matches!(a, Action::SendMessage { to, msg: Message::Pong } if *to == NodeId(2))
+        }));
+    }
+
+    #[test]
+    fn availability_is_active() {
+        assert!(Availability::Online.is_active());
+        assert!(Availability::Recovering.is_active());
+        assert!(!Availability::Offline.is_active());
+    }
+
+    #[test]
+    fn node_impl_dispatches_to_ping() {
+        let mut n = NodeImpl::Ping(PingNode::new(NodeId(7), Duration::from_millis(100)));
+        assert_eq!(n.id(), NodeId(7));
+        let a = n.on_start();
+        assert!(matches!(a[0], Action::ScheduleTimer { .. }));
     }
 }

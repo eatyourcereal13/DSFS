@@ -1,12 +1,4 @@
 //! Simulation engine.
-//!
-//! The engine owns the clock, the event queue, the nodes, the network model
-//! and the log. It is the only entity that mutates global state. Nodes are
-//! pure state machines returning `Action`s; the engine is the interpreter.
-//!
-//! Determinism contract: given the same initial configuration, the same
-//! master seed and the same `NetworkModel` implementation, the engine must
-//! produce an identical sequence of `LogRecord`s across runs.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -16,11 +8,17 @@ use crate::event::{EventId, EventKind, EventPayload, Priority};
 use crate::log::{EventLog, InMemoryLog, LogEventKind, LogRecord};
 use crate::message::Message;
 use crate::network::{NetworkModel, NullNetwork};
-use crate::node::{NodeId, PingNode};
+use crate::node::{Availability, NodeId, NodeImpl, PingNode};
 use crate::scheduler::EventQueue;
-use crate::time::VirtualTime;
+use crate::time::{Duration, VirtualTime};
 
 pub use crate::network::{Delivery, FullNetwork, LinkConfig};
+
+/// Base slowdown per incoming event, in nanoseconds, when `slow_factor > 1`.
+///
+/// Effective extra delay = `(slow_factor - 1.0) * SLOW_BASE_NANOS`. This
+/// is a fixed semantic constant, not a tunable (see DD-011).
+const SLOW_BASE_NANOS: u64 = 1_000_000;
 
 /// Engine configuration.
 #[derive(Clone, Debug)]
@@ -40,12 +38,22 @@ impl Default for EngineConfig {
     }
 }
 
+/// One slot in the engine's node table.
+#[derive(Debug)]
+struct NodeEntry {
+    node: NodeImpl,
+    availability: Availability,
+    /// Multiplier on incoming message delivery delay.
+    /// `1.0` = normal. `2.0` = every incoming message delayed by `SLOW_BASE`.
+    slow_factor: f64,
+}
+
 /// The deterministic simulation engine.
 pub struct SimulationEngine<L: EventLog, N: NetworkModel> {
     config: EngineConfig,
     clock: VirtualTime,
     queue: EventQueue<EventPayload>,
-    nodes: BTreeMap<NodeId, PingNode>,
+    nodes: BTreeMap<NodeId, NodeEntry>,
     network: N,
     log: L,
     next_event_id: u64,
@@ -74,18 +82,13 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         self.clock
     }
 
-    /// Returns a shared reference to the network model.
-    ///
-    /// Useful for tests and tooling that need to inspect link state.
+    /// Shared reference to the network model.
     #[must_use]
     pub fn network(&self) -> &N {
         &self.network
     }
 
-    /// Returns a mutable reference to the network model.
-    ///
-    /// Fault injection (Stage 7) will use this to reconfigure links
-    /// mid-simulation.
+    /// Mutable reference to the network model.
     pub fn network_mut(&mut self) -> &mut N {
         &mut self.network
     }
@@ -96,8 +99,18 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
     ///
     /// Returns an error if a node with the same id already exists, or if
     /// the node's `on_start` actions cannot be routed.
-    pub fn add_ping_node(&mut self, mut node: PingNode) -> io::Result<()> {
-        let id = node.id;
+    pub fn add_ping_node(&mut self, node: PingNode) -> io::Result<()> {
+        self.add_node(NodeImpl::Ping(node))
+    }
+
+    /// Adds a node of any supported kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a node with the same id already exists, or if
+    /// the node's `on_start` actions cannot be routed.
+    pub fn add_node(&mut self, mut node: NodeImpl) -> io::Result<()> {
+        let id = node.id();
         if self.nodes.contains_key(&id) {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -105,8 +118,73 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             ));
         }
         let start_actions = node.on_start();
-        self.nodes.insert(id, node);
+        self.nodes.insert(
+            id,
+            NodeEntry {
+                node,
+                availability: Availability::Online,
+                slow_factor: 1.0,
+            },
+        );
         self.route_actions(id, None, start_actions)
+    }
+
+    /// Sets the availability of a node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node does not exist.
+    pub fn set_availability(
+        &mut self,
+        node_id: NodeId,
+        availability: Availability,
+    ) -> io::Result<()> {
+        let entry = self.nodes.get_mut(&node_id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("node {node_id} not found"))
+        })?;
+        entry.availability = availability;
+        self.log.record(LogRecord {
+            event_id: EventId(u64::MAX),
+            time: self.clock,
+            kind: LogEventKind::NodeAvailabilityChanged {
+                node: node_id,
+                to: availability,
+            },
+            caused_by: None,
+        })
+    }
+
+    /// Sets the slow factor of a node (`>= 1.0`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node does not exist or `factor < 1.0`.
+    pub fn set_slow_factor(&mut self, node_id: NodeId, factor: f64) -> io::Result<()> {
+        if factor < 1.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("slow_factor must be >= 1.0, got {factor}"),
+            ));
+        }
+        let entry = self.nodes.get_mut(&node_id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("node {node_id} not found"))
+        })?;
+        entry.slow_factor = factor;
+        self.log.record(LogRecord {
+            event_id: EventId(u64::MAX),
+            time: self.clock,
+            kind: LogEventKind::NodeSlowFactorChanged {
+                node: node_id,
+                slow_factor_x1000: (factor * 1000.0) as u32,
+            },
+            caused_by: None,
+        })
+    }
+
+    /// Returns the availability of a node, if it exists.
+    #[must_use]
+    pub fn availability(&self, node_id: NodeId) -> Option<Availability> {
+        self.nodes.get(&node_id).map(|e| e.availability)
     }
 
     /// Consumes the engine and returns the log.
@@ -164,6 +242,21 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             EventKind::MessageDelivered { to, .. } => *to,
         };
 
+        // Availability check: offline nodes do not process any event.
+        // Timer expiry is ignored; message delivery is logged as a drop.
+        let availability = self
+            .nodes
+            .get(&node_id)
+            .map(|e| e.availability)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("node {node_id} not found"))
+            })?;
+
+        if !availability.is_active() {
+            return self.handle_offline_dispatch(node_id, event_id, caused_by, &payload);
+        }
+
+        // Log delivery of a network message.
         if let EventKind::MessageDelivered { from, .. } = &payload.kind {
             self.log.record(LogRecord {
                 event_id,
@@ -179,13 +272,51 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         let now = self.clock;
 
         let actions = {
-            let node = self.nodes.get_mut(&node_id).ok_or_else(|| {
+            let entry = self.nodes.get_mut(&node_id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("node {node_id} not found"))
             })?;
-            node.handle(now, event_id, &payload)
+            entry.node.handle(now, event_id, &payload)
         };
 
         self.route_actions(node_id, Some(event_id), actions)
+    }
+
+    fn handle_offline_dispatch(
+        &mut self,
+        node_id: NodeId,
+        event_id: EventId,
+        caused_by: Option<EventId>,
+        payload: &EventPayload,
+    ) -> io::Result<()> {
+        // If it's a message delivery to an offline node, log it as dropped
+        // (semantically: the network cannot reach a downed node). If it's a
+        // timer expiry, log it as ignored (semantically: the node was not
+        // running when the timer fired).
+        match &payload.kind {
+            EventKind::MessageDelivered { from, .. } => {
+                self.log.record(LogRecord {
+                    event_id,
+                    time: self.clock,
+                    kind: LogEventKind::MessageDropped {
+                        from: *from,
+                        to: node_id,
+                    },
+                    caused_by,
+                })?;
+            }
+            EventKind::TimerFired { .. } => {
+                self.log.record(LogRecord {
+                    event_id,
+                    time: self.clock,
+                    kind: LogEventKind::NodeIgnoredWhileOffline {
+                        node: node_id,
+                        event_id,
+                    },
+                    caused_by,
+                })?;
+            }
+        }
+        Ok(())
     }
 
     fn route_actions(
@@ -196,9 +327,9 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
     ) -> io::Result<()> {
         let peer_ids: Vec<NodeId> = self
             .nodes
-            .keys()
-            .copied()
-            .filter(|id| *id != source)
+            .iter()
+            .filter(|(id, entry)| **id != source && entry.availability.is_active())
+            .map(|(id, _)| *id)
             .collect();
 
         for action in actions {
@@ -257,6 +388,13 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             return Ok(());
         }
 
+        let slow = self.nodes.get(&to).map(|e| e.slow_factor).unwrap_or(1.0);
+        let extra_ns = if slow > 1.0 {
+            ((slow - 1.0) * SLOW_BASE_NANOS as f64) as u64
+        } else {
+            0
+        };
+
         for d in deliveries {
             self.log.record(LogRecord {
                 event_id: caused_by.unwrap_or(EventId(u64::MAX)),
@@ -268,8 +406,19 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
                 },
                 caused_by,
             })?;
+            let deliver_at = if extra_ns > 0 {
+                self.log.record(LogRecord {
+                    event_id: caused_by.unwrap_or(EventId(u64::MAX)),
+                    time: self.clock,
+                    kind: LogEventKind::MessageDelayedBySlowNode { from, to },
+                    caused_by,
+                })?;
+                d.at + Duration::from_nanos(extra_ns)
+            } else {
+                d.at
+            };
             self.queue.schedule(
-                d.at,
+                deliver_at,
                 Priority::Network,
                 EventPayload::new(EventKind::MessageDelivered { to, from, msg }, caused_by),
             );
@@ -279,9 +428,6 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
 }
 
 /// Convenience constructor with in-memory log and null network.
-///
-/// Free function rather than an associated method because type inference
-/// cannot resolve `SimulationEngine`'s generics from an associated call.
 #[must_use]
 pub fn new_in_memory_engine(config: EngineConfig) -> SimulationEngine<InMemoryLog, NullNetwork> {
     SimulationEngine::new(config, NullNetwork, InMemoryLog::new())
@@ -363,7 +509,6 @@ mod tests {
             .unwrap();
         e.run().unwrap();
         let log = e.into_log();
-        // With 50 ms latency and 10 ms ping interval, deliveries lag behind sends.
         let first_send = log
             .records()
             .iter()
@@ -380,5 +525,44 @@ mod tests {
             first_delivery.time,
             first_send.time
         );
+    }
+
+    #[test]
+    fn offline_node_does_not_process_messages() {
+        let mut e = make_engine();
+        e.add_ping_node(PingNode::new(NodeId(1), Duration::from_millis(100)))
+            .unwrap();
+        e.add_ping_node(PingNode::new(NodeId(2), Duration::from_millis(100)))
+            .unwrap();
+        e.set_availability(NodeId(2), Availability::Offline)
+            .unwrap();
+        e.run().unwrap();
+        let log = e.into_log();
+        let pongs_to_2 = log
+            .records()
+            .iter()
+            .filter(
+                |r| matches!(r.kind, LogEventKind::PongReceived { node, .. } if node == NodeId(2)),
+            )
+            .count();
+        assert_eq!(pongs_to_2, 0, "offline node must not receive pongs");
+    }
+
+    #[test]
+    fn set_slow_factor_validates_input() {
+        let mut e = make_engine();
+        e.add_ping_node(PingNode::new(NodeId(1), Duration::from_millis(100)))
+            .unwrap();
+        let err = e.set_slow_factor(NodeId(1), 0.5).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn set_availability_rejects_missing_node() {
+        let mut e = make_engine();
+        let err = e
+            .set_availability(NodeId(99), Availability::Offline)
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }
