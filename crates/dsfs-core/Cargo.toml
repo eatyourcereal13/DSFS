@@ -11,3 +11,4 @@ authors.workspace = true
 thiserror.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
+dsfs-raft.workspace = true

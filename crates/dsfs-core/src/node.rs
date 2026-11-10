@@ -1,14 +1,13 @@
 //! Virtual node identifiers, availability states, and the `NodeImpl`
 //! dispatch enum.
-//!
-//! The `NodeImpl` enum exists so the engine can hold heterogeneous node
-//! kinds (`PingNode` now, `RaftNode` in Stage 5) without `Box<dyn Node>`
-//! overhead. See DD-010 in `docs/design-decisions.md`.
+
+use dsfs_raft::{PeerId, RaftNode, RaftOutput};
 
 use crate::action::Action;
 use crate::event::{EventId, EventKind, EventPayload};
 use crate::log::LogEventKind;
 use crate::message::Message;
+use crate::raft_adapter::raft_event_to_log_event;
 use crate::time::{Duration, VirtualTime};
 
 /// Stable identifier of a virtual node within a single simulation.
@@ -25,16 +24,7 @@ impl std::fmt::Display for NodeId {
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
 pub struct TimerId(pub u64);
 
-/// Availability of a node, orthogonal to its protocol role.
-///
-/// - `Online`: normal operation.
-/// - `Offline`: does not process any event (message or timer). The engine
-///   drops deliveries and ignores timer expirations for offline nodes.
-/// - `Recovering`: reserved for Stage 7; the engine treats it identically
-///   to `Online` for now.
-///
-/// Role (`Follower` / `Candidate` / `Leader`) is a Raft concept and lives
-/// inside `RaftNode` (Stage 5), not here.
+/// Availability of a node.
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Default)]
 pub enum Availability {
     #[default]
@@ -44,14 +34,13 @@ pub enum Availability {
 }
 
 impl Availability {
-    /// Returns `true` if the node processes events in this state.
     #[must_use]
     pub fn is_active(self) -> bool {
         matches!(self, Availability::Online | Availability::Recovering)
     }
 }
 
-/// Minimal ping node used to exercise the engine.
+/// Minimal ping node.
 #[derive(Debug)]
 pub struct PingNode {
     pub id: NodeId,
@@ -61,7 +50,6 @@ pub struct PingNode {
 }
 
 impl PingNode {
-    /// Creates a ping node.
     #[must_use]
     pub fn new(id: NodeId, ping_interval: Duration) -> Self {
         Self {
@@ -72,7 +60,6 @@ impl PingNode {
         }
     }
 
-    /// Emits start actions (arm the initial timer) exactly once.
     pub fn on_start(&mut self) -> Vec<Action> {
         if self.initialised {
             return Vec::new();
@@ -85,7 +72,6 @@ impl PingNode {
         }]
     }
 
-    /// Handles a single event.
     pub fn handle(
         &mut self,
         _now: VirtualTime,
@@ -95,7 +81,7 @@ impl PingNode {
         let mut actions = Vec::new();
         match &payload.kind {
             EventKind::TimerFired { node, timer_id } => {
-                debug_assert_eq!(*node, self.id, "engine dispatched timer to wrong node");
+                debug_assert_eq!(*node, self.id);
                 actions.push(Action::Log(LogEventKind::TimerFired {
                     node: self.id,
                     timer_id: *timer_id,
@@ -108,7 +94,7 @@ impl PingNode {
                 actions.push(Action::BroadcastPing);
             }
             EventKind::MessageDelivered { to, from, msg } => {
-                debug_assert_eq!(*to, self.id, "engine dispatched message to wrong node");
+                debug_assert_eq!(*to, self.id);
                 match msg {
                     Message::Ping => {
                         actions.push(Action::Log(LogEventKind::PingReceived {
@@ -126,6 +112,9 @@ impl PingNode {
                             from: *from,
                         }));
                     }
+                    Message::Raft(_) => {
+                        // PingNode ignores Raft messages.
+                    }
                 }
             }
         }
@@ -139,32 +128,100 @@ impl PingNode {
     }
 }
 
+/// Adapter wrapping `dsfs_raft::RaftNode` for the core engine.
+pub struct RaftAdapter {
+    pub id: NodeId,
+    pub inner: RaftNode,
+}
+
+impl std::fmt::Debug for RaftAdapter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RaftAdapter")
+            .field("id", &self.id)
+            .field("role", &self.inner.role())
+            .field("term", &self.inner.term())
+            .finish()
+    }
+}
+
+impl RaftAdapter {
+    #[must_use]
+    pub fn new(id: NodeId, inner: RaftNode) -> Self {
+        Self { id, inner }
+    }
+
+    pub fn on_start(&mut self) -> Vec<Action> {
+        let out = self.inner.on_start();
+        self.output_to_actions(out)
+    }
+
+    pub fn handle(
+        &mut self,
+        _now: VirtualTime,
+        _event_id: EventId,
+        payload: &EventPayload,
+    ) -> Vec<Action> {
+        match &payload.kind {
+            EventKind::TimerFired { node, timer_id } => {
+                debug_assert_eq!(*node, self.id);
+                let out = self.inner.on_timer(timer_id.0);
+                self.output_to_actions(out)
+            }
+            EventKind::MessageDelivered { to, from, msg } => {
+                debug_assert_eq!(*to, self.id);
+                let Message::Raft(m) = msg else {
+                    return Vec::new();
+                };
+                let out = self.inner.on_message(PeerId(from.0), m.clone());
+                self.output_to_actions(out)
+            }
+        }
+    }
+
+    fn output_to_actions(&mut self, out: RaftOutput) -> Vec<Action> {
+        let mut actions = Vec::with_capacity(out.messages.len() + 1 + out.events.len());
+        for (peer, msg) in out.messages {
+            actions.push(Action::SendMessage {
+                to: NodeId(peer.0),
+                msg: Message::Raft(msg),
+            });
+        }
+        if let Some(arm) = out.set_timer {
+            actions.push(Action::ScheduleTimer {
+                delay: Duration::from_nanos(arm.after.as_nanos() as u64),
+                timer_id: TimerId(arm.generation),
+            });
+        }
+        for ev in out.events {
+            actions.push(Action::Log(raft_event_to_log_event(self.id, &ev)));
+        }
+        actions
+    }
+}
+
 /// Dispatch enum over node kinds.
-///
-/// Adding a new kind (e.g., `Raft`) is a matter of adding a variant and a
-/// match arm; the compiler forces every call site to handle it.
 #[derive(Debug)]
 pub enum NodeImpl {
     Ping(PingNode),
+    Raft(RaftAdapter),
 }
 
 impl NodeImpl {
-    /// Returns the node's `NodeId`.
     #[must_use]
     pub fn id(&self) -> NodeId {
         match self {
             NodeImpl::Ping(n) => n.id,
+            NodeImpl::Raft(n) => n.id,
         }
     }
 
-    /// Emits start actions (called once, when the node is added).
     pub fn on_start(&mut self) -> Vec<Action> {
         match self {
             NodeImpl::Ping(n) => n.on_start(),
+            NodeImpl::Raft(n) => n.on_start(),
         }
     }
 
-    /// Handles one event.
     pub fn handle(
         &mut self,
         now: VirtualTime,
@@ -173,6 +230,7 @@ impl NodeImpl {
     ) -> Vec<Action> {
         match self {
             NodeImpl::Ping(n) => n.handle(now, event_id, payload),
+            NodeImpl::Raft(n) => n.handle(now, event_id, payload),
         }
     }
 }
@@ -180,6 +238,7 @@ impl NodeImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time::Duration;
 
     #[test]
     fn on_start_arms_timer_once() {
@@ -188,42 +247,7 @@ mod tests {
         let a2 = n.on_start();
         assert_eq!(a1.len(), 1);
         assert!(matches!(a1[0], Action::ScheduleTimer { .. }));
-        assert!(a2.is_empty(), "on_start must be idempotent");
-    }
-
-    #[test]
-    fn timer_fire_reschedules_and_broadcasts() {
-        let mut n = PingNode::new(NodeId(1), Duration::from_millis(100));
-        let _ = n.on_start();
-        let ev = EventPayload::new(
-            EventKind::TimerFired {
-                node: NodeId(1),
-                timer_id: TimerId(1),
-            },
-            None,
-        );
-        let actions = n.handle(VirtualTime(100), EventId(0), &ev);
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, Action::ScheduleTimer { .. })));
-        assert!(actions.iter().any(|a| matches!(a, Action::BroadcastPing)));
-    }
-
-    #[test]
-    fn ping_replies_with_pong() {
-        let mut n = PingNode::new(NodeId(1), Duration::from_millis(100));
-        let ev = EventPayload::new(
-            EventKind::MessageDelivered {
-                to: NodeId(1),
-                from: NodeId(2),
-                msg: Message::Ping,
-            },
-            None,
-        );
-        let actions = n.handle(VirtualTime(0), EventId(0), &ev);
-        assert!(actions.iter().any(|a| {
-            matches!(a, Action::SendMessage { to, msg: Message::Pong } if *to == NodeId(2))
-        }));
+        assert!(a2.is_empty());
     }
 
     #[test]

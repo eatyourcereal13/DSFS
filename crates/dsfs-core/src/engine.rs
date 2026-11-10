@@ -420,7 +420,14 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             self.queue.schedule(
                 deliver_at,
                 Priority::Network,
-                EventPayload::new(EventKind::MessageDelivered { to, from, msg }, caused_by),
+                EventPayload::new(
+                    EventKind::MessageDelivered {
+                        to,
+                        from,
+                        msg: msg.clone(),
+                    },
+                    caused_by,
+                ),
             );
         }
         Ok(())

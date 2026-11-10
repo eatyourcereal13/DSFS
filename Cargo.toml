@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/dsfs-core",
+    "crates/dsfs-raft",
 ]
 
 [workspace.package]
@@ -16,6 +17,7 @@ authors = ["DSFS Authors"]
 thiserror = "1.0"
 rand = "0.8"
 rand_chacha = "0.3"
+dsfs-raft = { path = "crates/dsfs-raft" }
 
 [profile.release]
 lto = "thin"

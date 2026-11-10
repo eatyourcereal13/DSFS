@@ -260,3 +260,83 @@ Raft (Этап 5) должен перезапустить election-таймер 
 `Recovering` (например, «узел запускается, но ещё не готов принимать
 трафик») требует дизайна протокольной части (Raft recovery). До Этапа 7
 достаточно `Online`/`Offline`.
+
+---
+
+## DD-014. `dsfs-raft` is a standalone crate without `dsfs-core`
+
+**Решение.** `dsfs-raft` не зависит от `dsfs-core`. Все взаимодействия
+с внешним миром — через `RaftOutput` (сообщения, таймеры, события) и
+через `RaftRng` trait. Обёртка `RaftAdapter` живёт в `dsfs-core` и
+конвертирует между мирами.
+
+**Обоснование.**
+- **Тестируемость.** Raft тестируется в unit-тестах без движка, сети,
+  виртуального времени.
+- **Переиспользуемость.** Крейт можно взять в другой проект.
+- **Границы.** Если `dsfs-core` перепишут — Raft не пострадает.
+- **Чистота.** Raft не знает про `NodeId`, `VirtualTime`, `Action`.
+
+**Последствия.** Адаптер `RaftAdapter` — тонкий (20–30 строк кода).
+Любые изменения в протоколе, требующие «знать больше» (например,
+Raft-специфичные поля в `LogRecord`) добавляются в `RaftEvent` и
+транслируются в `raft_adapter.rs`.
+
+---
+
+## DD-015. Raft timer: generation, not cancellation
+
+**Решение.** Таймеры Raft используют **generation** — монотонный счётчик,
+инкрементируемый при каждом перезапуске таймера. `RaftNode::on_timer(gen)`
+игнорирует вызов, если `gen != self.timer_generation`.
+
+**Обоснование.**
+- Не нужен `Action::CancelTimer` в движке. Движок прост: он только
+  регистрирует и выполняет `TimerFired`, ничего не отменяет.
+- Устаревшие таймеры не удаляются из очереди, но их эффект нулевой.
+  Это не оптимально по памяти, но детерминировано и просто.
+- В `RaftNode` при `arm_timer` generation инкрементируется; в
+  `RaftOutput::set_timer` возвращается `TimerArm { generation, after }`.
+  Adapter конвертирует в `Action::ScheduleTimer { timer_id: TimerId(gen) }`.
+
+**Последствия.** Каждое arm = +1 `TimerId`. В `RaftNode::on_timer(gen)`
+сравнение O(1).
+
+---
+
+## DD-016. Raft messages carry Stage-6 fields from the start
+
+**Решение.** `RaftMessage::RequestVote` содержит `last_log_index` и
+`last_log_term`; `RaftMessage::AppendEntries` содержит
+`prev_log_index`, `prev_log_term`, `entries`, `leader_commit` —
+**уже на Этапе 5**, хотя логика репликации появится только на Этапе 6.
+
+**Обоснование.**
+- Enum лучше определить один раз; переделывать формат сообщений на
+  Этапе 6 — лишняя работа и лишние правки в тестах.
+- На Этапе 5 эти поля содержат «пустые» значения (index=0, term=0,
+  entries=[], commit=0), что не мешает выборам.
+- Это не усложняет код: `LogEntry` на Этапе 5 — две `u64`-подобные
+  структуры.
+
+**Последствия.** `LogEntry` содержит только `index` и `term` (без
+`command`); `command` добавится на Этапе 6 как `Vec<u8>`.
+
+---
+
+## DD-017. Randomized election timeout via `RaftRng` trait, not a hard dependency
+
+**Решение.** `dsfs-raft` определяет trait `RaftRng { fn gen_range_u64(...) }`.
+`dsfs-core` реализует его для `StreamRng`. В unit-тестах `dsfs-raft`
+используется `CyclicRng` — детерминированный mock.
+
+**Обоснование.**
+- `dsfs-raft` не тащит `rand` или `rand_chacha` — не нужен.
+- В тестах Raft полностью контролируем RNG, тесты строго детерминированы.
+- `dsfs-core` даёт `StreamRng` с per-purpose stream (DD-003): election
+  timeout узла 3 не сдвигается, если добавим случайность в другом месте.
+
+**Последствия.** Один `Box<dyn RaftRng>` в `RaftNode`. `Box` здесь
+неизбежен (RaftNode не generic по RNG — иначе все методы становятся
+generic). Стоимость — один virtual call на election timeout (раз в
+100–200 мс виртуального времени). Приемлемо.
