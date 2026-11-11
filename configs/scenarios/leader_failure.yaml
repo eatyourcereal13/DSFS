@@ -15,7 +15,7 @@ network:
 events:
   - wait_for_leader: {}
   - at_ms: 1000
-    crash_node: 3
+    crash_leader: {}
   - wait_for_leader: {}
   - at_ms: 3000
     submit_write:

@@ -15,6 +15,11 @@ pub enum InjectionOutcome {
     Crash(NodeId),
     /// Bring a node back online.
     Restart(NodeId),
+    /// Crash whichever node is currently the leader. The engine resolves
+    /// the leader at apply time; if none exists, the outcome is a no-op.
+    CrashLeader,
+    /// Restart the node that was most recently crashed by `CrashLeader`.
+    RestartCrashedLeader,
     /// Cut all cross-links between two groups.
     Partition {
         group_a: Vec<NodeId>,
@@ -77,17 +82,11 @@ impl FaultInjector {
         !self.pending.is_empty()
     }
 
-    /// Returns the earliest virtual time among the pending events, if any
-    /// (skipping `wait_for_leader`, which has no time).
     #[must_use]
     pub fn next_event_time(&self) -> Option<VirtualTime> {
         self.pending.front().and_then(|p| p.at)
     }
 
-    /// Attempts to fire the next event.
-    ///
-    /// - `now` — current virtual time.
-    /// - `leader_exists` — whether the engine currently sees a leader.
     pub fn try_fire(
         &mut self,
         now: VirtualTime,
@@ -123,6 +122,8 @@ fn outcome_from_action(action: &FaultAction) -> Option<InjectionOutcome> {
         FaultAction::WaitForLeader {} => None,
         FaultAction::CrashNode { node } => Some(InjectionOutcome::Crash(NodeId(*node))),
         FaultAction::RestartNode { node } => Some(InjectionOutcome::Restart(NodeId(*node))),
+        FaultAction::CrashLeader {} => Some(InjectionOutcome::CrashLeader),
+        FaultAction::RestartCrashedLeader {} => Some(InjectionOutcome::RestartCrashedLeader),
         FaultAction::Partition { groups } => Some(InjectionOutcome::Partition {
             group_a: groups[0].iter().map(|n| NodeId(*n)).collect(),
             group_b: groups[1].iter().map(|n| NodeId(*n)).collect(),

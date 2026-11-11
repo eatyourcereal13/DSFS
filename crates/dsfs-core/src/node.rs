@@ -265,6 +265,38 @@ impl NodeImpl {
             _ => None,
         }
     }
+
+    #[must_use]
+    pub fn raft_role(&self) -> Option<dsfs_raft::Role> {
+        match self {
+            NodeImpl::Raft(a) => Some(a.inner.role()),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn raft_term(&self) -> Option<u64> {
+        match self {
+            NodeImpl::Raft(a) => Some(a.inner.term().0),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn raft_log_len(&self) -> Option<u64> {
+        match self {
+            NodeImpl::Raft(a) => Some(a.inner.last_log_index()),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn raft_voted_for(&self) -> Option<Option<u32>> {
+        match self {
+            NodeImpl::Raft(a) => Some(a.inner.voted_for().map(|p| p.0)),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]

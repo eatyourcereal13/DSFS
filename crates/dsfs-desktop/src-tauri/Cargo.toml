@@ -1,0 +1,24 @@
+[package]
+name = "dsfs-desktop-app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "dsfs_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dsfs-core = { path = "../../dsfs-core" }
+dsfs-checker = { path = "../../dsfs-checker" }
+dsfs-raft = { path = "../../dsfs-raft" }
+
+[features]
+custom-protocol = ["tauri/custom-protocol"]
+
+[workspace]

@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DSFS</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="title">
+      <span class="logo">DSFS</span>
+    </div>
+    <div class="controls">
+      <select id="scenarioSelect">
+        <option value="">scenario</option>
+      </select>
+      <button id="loadBtn">Load</button>
+      <button id="runBtn">Run</button>
+      <button id="pauseBtn">Pause</button>
+      <button id="resetBtn">Reset</button>
+      <select id="speedSelect">
+        <option value="0.5">0.5x</option>
+        <option value="1" selected>1x</option>
+        <option value="2">2x</option>
+        <option value="4">4x</option>
+      </select>
+    </div>
+  </header>
+
+  <main>
+    <section class="panel cluster-panel" id="clusterPanel">
+      <h2>Cluster</h2>
+      <div id="cluster" class="cluster"></div>
+    </section>
+    <section class="panel events-panel" id="eventsPanel">
+      <h2>Events</h2>
+      <div id="events" class="events"></div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="status">
+      <span>t: <b id="timeVal">0</b>ms</span>
+      <span>seed: <b id="seedVal">-</b></span>
+      <span>scenario: <b id="scenarioVal">-</b></span>
+      <span>state: <b id="stateVal">-</b></span>
+    </div>
+    <div class="stats">
+      <span>sent <b id="statSent">0</b></span>
+      <span>dropped <b id="statDropped">0</b></span>
+      <span>dup <b id="statDup">0</b></span>
+      <span>leaders <b id="statLeaders">0</b></span>
+      <span>applied <b id="statApplied">0</b></span>
+    </div>
+    <div class="faults" id="faults"></div>
+  </footer>
+
+  <div class="welcome-overlay" id="welcome">
+    <div class="welcome-card">
+      <h1>DSFS</h1>
+      <p class="welcome-desc">Симулятор распределённых систем с внедрением отказов. Выбери сценарий:</p>
+
+      <div class="tour-choice">
+        <button class="tour-card-btn" data-tour="leader_failure">
+          <div class="tour-card-title">Лидер падает</div>
+          <div class="tour-card-desc">
+            5 узлов. Лидер падает. Проверяем, что данные не потеряны и кластер избирает нового лидера.
+          </div>
+        </button>
+        <button class="tour-card-btn" data-tour="network_partition">
+          <div class="tour-card-title">Сетевое разделение</div>
+          <div class="tour-card-desc">
+            5 узлов. Сеть разделена на 2 и 3. Проверяем, что только большинство принимает изменения.
+          </div>
+        </button>
+        <button class="tour-card-btn" data-tour="node_recovery">
+          <div class="tour-card-title">Восстановление узла</div>
+          <div class="tour-card-desc">
+            5 узлов. Один узел отключается, пропускает запись, затем возвращается и догоняет журнал.
+          </div>
+        </button>
+      </div>
+
+      <button class="btn-secondary" id="skipTourBtn">Свободный режим</button>
+    </div>
+  </div>
+
+  <div class="tour-overlay" id="tour" style="display:none;">
+    <div class="tour-card">
+      <h2 class="tour-title" id="tourTitle"></h2>
+      <div class="tour-body" id="tourBody"></div>
+      <div class="tour-actions">
+        <button class="btn-secondary" id="tourStopBtn">Выйти</button>
+        <button class="btn-primary" id="tourNextBtn" disabled>Далее</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="main.js"></script>
+</body>
+</html>

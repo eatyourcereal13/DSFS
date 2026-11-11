@@ -5,8 +5,7 @@
 //! fully deterministic (tests can supply a fixed RNG).
 
 /// RNG interface for the Raft state machine.
-pub trait RaftRng {
-    /// Returns a `u64` in `[low, high)`. Panics if `low >= high`.
+pub trait RaftRng: Send {
     fn gen_range_u64(&mut self, low: u64, high: u64) -> u64;
 }
 

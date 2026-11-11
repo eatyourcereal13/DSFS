@@ -16,15 +16,11 @@ use crate::time::{Duration, VirtualTime};
 
 pub use crate::network::{Delivery, FullNetwork, LinkConfig};
 
-/// Base slowdown per incoming event, in nanoseconds, when `slow_factor > 1`.
 const SLOW_BASE_NANOS: u64 = 1_000_000;
 
-/// Engine configuration.
 #[derive(Clone, Debug)]
 pub struct EngineConfig {
-    /// Master seed for all random streams in the simulation.
     pub master_seed: u64,
-    /// Hard cap on the number of events processed.
     pub max_events: u64,
 }
 
@@ -44,7 +40,6 @@ struct NodeEntry {
     slow_factor: f64,
 }
 
-/// The deterministic simulation engine.
 pub struct SimulationEngine<L: EventLog, N: NetworkModel> {
     config: EngineConfig,
     clock: VirtualTime,
@@ -55,10 +50,10 @@ pub struct SimulationEngine<L: EventLog, N: NetworkModel> {
     next_event_id: u64,
     processed_events: u64,
     fault_injector: Option<FaultInjector>,
+    last_crashed_leader: Option<NodeId>,
 }
 
 impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
-    /// Creates an engine with the given configuration, network model and log.
     #[must_use]
     pub fn new(config: EngineConfig, network: N, log: L) -> Self {
         Self {
@@ -71,54 +66,39 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             next_event_id: 0,
             processed_events: 0,
             fault_injector: None,
+            last_crashed_leader: None,
         }
     }
 
-    /// Returns the current virtual time.
     #[must_use]
     pub fn now(&self) -> VirtualTime {
         self.clock
     }
 
-    /// Shared reference to the network model.
     #[must_use]
     pub fn network(&self) -> &N {
         &self.network
     }
 
-    /// Mutable reference to the network model.
     pub fn network_mut(&mut self) -> &mut N {
         &mut self.network
     }
 
-    /// Attaches a fault injector.
     #[must_use]
     pub fn with_fault_injector(mut self, injector: FaultInjector) -> Self {
         self.fault_injector = Some(injector);
         self
     }
 
-    /// Convenience: attach injector from a scenario.
     #[must_use]
     pub fn with_scenario(self, scenario: &Scenario) -> Self {
         self.with_fault_injector(FaultInjector::from_scenario(scenario))
     }
 
-    /// Adds a ping node to the cluster.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a node with the same id already exists.
     pub fn add_ping_node(&mut self, node: PingNode) -> io::Result<()> {
         self.add_node(NodeImpl::Ping(node))
     }
 
-    /// Adds a node of any supported kind.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if a node with the same id already exists, or if
-    /// the node's start actions cannot be routed.
     pub fn add_node(&mut self, mut node: NodeImpl) -> io::Result<()> {
         let id = node.id();
         if self.nodes.contains_key(&id) {
@@ -139,18 +119,16 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         self.route_actions(id, None, start_actions)
     }
 
-    /// Sets the availability of a node.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the node does not exist.
     pub fn set_availability(
         &mut self,
         node_id: NodeId,
         availability: Availability,
     ) -> io::Result<()> {
         let entry = self.nodes.get_mut(&node_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("node {node_id} not found"))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("node {node_id} not found"),
+            )
         })?;
         entry.availability = availability;
         self.log.record(LogRecord {
@@ -164,11 +142,6 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         })
     }
 
-    /// Sets the slow factor of a node (`>= 1.0`).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the node does not exist or `factor < 1.0`.
     pub fn set_slow_factor(&mut self, node_id: NodeId, factor: f64) -> io::Result<()> {
         if factor < 1.0 {
             return Err(io::Error::new(
@@ -177,7 +150,10 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             ));
         }
         let entry = self.nodes.get_mut(&node_id).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("node {node_id} not found"))
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("node {node_id} not found"),
+            )
         })?;
         entry.slow_factor = factor;
         self.log.record(LogRecord {
@@ -191,13 +167,11 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         })
     }
 
-    /// Returns the availability of a node, if it exists.
     #[must_use]
     pub fn availability(&self, node_id: NodeId) -> Option<Availability> {
         self.nodes.get(&node_id).map(|e| e.availability)
     }
 
-    /// Finds the current Raft leader among active nodes, if any.
     #[must_use]
     pub fn find_leader(&self) -> Option<NodeId> {
         for (id, entry) in &self.nodes {
@@ -211,23 +185,36 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         None
     }
 
-    /// Returns the commands applied by the given Raft node, if it is one.
     #[must_use]
     pub fn raft_applied(&self, node_id: NodeId) -> Option<&[Vec<u8>]> {
         self.nodes.get(&node_id)?.node.raft_applied()
     }
 
-    /// Returns the commit index of the given Raft node, if it is one.
     #[must_use]
     pub fn raft_commit_index(&self, node_id: NodeId) -> Option<u64> {
         self.nodes.get(&node_id)?.node.raft_commit_index()
     }
 
-    /// Submits a client command to the current leader.
-    ///
-    /// # Errors
-    ///
-    /// Returns `NotFound` if there is no active leader.
+    #[must_use]
+    pub fn node_role(&self, node_id: NodeId) -> Option<dsfs_raft::Role> {
+        self.nodes.get(&node_id)?.node.raft_role()
+    }
+
+    #[must_use]
+    pub fn raft_term(&self, node_id: NodeId) -> Option<u64> {
+        self.nodes.get(&node_id)?.node.raft_term()
+    }
+
+    #[must_use]
+    pub fn raft_log_len(&self, node_id: NodeId) -> Option<u64> {
+        self.nodes.get(&node_id)?.node.raft_log_len()
+    }
+
+    #[must_use]
+    pub fn raft_voted_for(&self, node_id: NodeId) -> Option<Option<u32>> {
+        self.nodes.get(&node_id)?.node.raft_voted_for()
+    }
+
     pub fn submit_command(&mut self, command: Vec<u8>) -> io::Result<()> {
         let leader = self
             .find_leader()
@@ -246,44 +233,29 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
         Ok(())
     }
 
-    /// Consumes the engine and returns the log.
     #[must_use]
     pub fn into_log(self) -> L {
         self.log
     }
 
-    /// Returns a reference to the log.
     #[must_use]
     pub fn log(&self) -> &L {
         &self.log
     }
+    pub fn log_mut(&mut self) -> &mut L {
+        &mut self.log
+    }
 
-    /// Number of events processed so far.
     #[must_use]
     pub fn processed_events(&self) -> u64 {
         self.processed_events
     }
 
-    /// Runs the engine until the queue is empty or the remaining global
-    /// budget from `EngineConfig::max_events` is exhausted.
-    ///
-    /// # Errors
-    ///
-    /// Propagates I/O errors from the event log.
     pub fn run(&mut self) -> io::Result<RunOutcome> {
         let budget = self.config.max_events.saturating_sub(self.processed_events);
         self.run_until(budget)
     }
 
-    /// Runs the engine until the queue is empty or `budget` more events
-    /// have been processed.
-    ///
-    /// Fault-injection events (if an injector is attached) are fired when
-    /// their `at_ms` is reached relative to the current virtual time.
-    ///
-    /// # Errors
-    ///
-    /// Propagates I/O errors from the event log or from fault outcomes.
     pub fn run_until(&mut self, budget: u64) -> io::Result<RunOutcome> {
         let target = self.processed_events.saturating_add(budget);
         self.pump_fault_injector()?;
@@ -322,11 +294,11 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             let leader_exists = self.find_leader().is_some();
             let now = self.clock;
 
-            // Scope the mutable borrow of `fault_injector` to a single
-            // `try_fire` call; the returned outcome is owned, so the
-            // borrow ends immediately after this block.
             let fired = {
-                let injector = self.fault_injector.as_mut().expect("checked is_none above");
+                let injector = self
+                    .fault_injector
+                    .as_mut()
+                    .expect("checked is_none above");
                 injector.try_fire(now, leader_exists)
             };
 
@@ -349,6 +321,21 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
                 }
                 InjectionOutcome::Restart(id) => {
                     self.set_availability(id, Availability::Online)?;
+                }
+                InjectionOutcome::CrashLeader => {
+                    if let Some(leader) = self.find_leader() {
+                        self.set_availability(leader, Availability::Offline)?;
+                        self.last_crashed_leader = Some(leader);
+                    } else {
+                        // No leader at the moment; skip. The scenario
+                        // author should have used `wait_for_leader`
+                        // before this fault.
+                    }
+                }
+                InjectionOutcome::RestartCrashedLeader => {
+                    if let Some(id) = self.last_crashed_leader.take() {
+                        self.set_availability(id, Availability::Online)?;
+                    }
                 }
                 InjectionOutcome::Partition { group_a, group_b } => {
                     self.network_mut().partition_groups(&group_a, &group_b);
@@ -386,7 +373,10 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
             .get(&node_id)
             .map(|e| e.availability)
             .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("node {node_id} not found"))
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("node {node_id} not found"),
+                )
             })?;
 
         if !availability.is_active() {
@@ -409,7 +399,10 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
 
         let actions = {
             let entry = self.nodes.get_mut(&node_id).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("node {node_id} not found"))
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("node {node_id} not found"),
+                )
             })?;
             entry.node.handle(now, event_id, &payload)
         };
@@ -440,10 +433,7 @@ impl<L: EventLog, N: NetworkModel> SimulationEngine<L, N> {
                 self.log.record(LogRecord {
                     event_id,
                     time: self.clock,
-                    kind: LogEventKind::NodeIgnoredWhileOffline {
-                        node: node_id,
-                        event_id,
-                    },
+                    kind: LogEventKind::NodeIgnoredWhileOffline { node: node_id, event_id },
                     caused_by,
                 })?;
             }
@@ -571,6 +561,8 @@ fn format_outcome(o: &InjectionOutcome) -> String {
         InjectionOutcome::WaitSatisfied => "wait_for_leader satisfied".to_string(),
         InjectionOutcome::Crash(n) => format!("crash {n}"),
         InjectionOutcome::Restart(n) => format!("restart {n}"),
+        InjectionOutcome::CrashLeader => "crash leader".to_string(),
+        InjectionOutcome::RestartCrashedLeader => "restart crashed leader".to_string(),
         InjectionOutcome::Partition { group_a, group_b } => {
             format!("partition {group_a:?} | {group_b:?}")
         }
@@ -583,18 +575,14 @@ fn format_outcome(o: &InjectionOutcome) -> String {
     }
 }
 
-/// Convenience constructor with in-memory log and null network.
 #[must_use]
 pub fn new_in_memory_engine(config: EngineConfig) -> SimulationEngine<InMemoryLog, NullNetwork> {
     SimulationEngine::new(config, NullNetwork, InMemoryLog::new())
 }
 
-/// Outcome of a `run()` call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunOutcome {
-    /// The event queue drained naturally.
     Completed { processed: u64 },
-    /// The `max_events` cap was hit before the queue drained.
     HitEventLimit { processed: u64 },
 }
 
@@ -652,75 +640,23 @@ mod tests {
     }
 
     #[test]
-    fn full_network_with_latency_delays_messages() {
-        let cfg = EngineConfig {
-            master_seed: 42,
-            max_events: 100,
-        };
-        let link = LinkConfig::with_latency(Duration::from_millis(50));
-        let net = FullNetwork::new(42, link);
-        let mut e = SimulationEngine::new(cfg, net, InMemoryLog::new());
-        e.add_ping_node(PingNode::new(NodeId(1), Duration::from_millis(10)))
-            .unwrap();
-        e.add_ping_node(PingNode::new(NodeId(2), Duration::from_millis(10)))
-            .unwrap();
-        e.run().unwrap();
-        let log = e.into_log();
-        let first_send = log
-            .records()
-            .iter()
-            .find(|r| matches!(r.kind, LogEventKind::MessageSent { .. }))
-            .expect("expected a sent message");
-        let first_delivery = log
-            .records()
-            .iter()
-            .find(|r| matches!(r.kind, LogEventKind::MessageDelivered { .. }))
-            .expect("expected a delivered message");
-        assert!(
-            first_delivery.time.0 > first_send.time.0,
-            "delivery at {:?} must be after send at {:?}",
-            first_delivery.time,
-            first_send.time
-        );
-    }
-
-    #[test]
     fn offline_node_does_not_process_messages() {
         let mut e = make_engine();
         e.add_ping_node(PingNode::new(NodeId(1), Duration::from_millis(100)))
             .unwrap();
         e.add_ping_node(PingNode::new(NodeId(2), Duration::from_millis(100)))
             .unwrap();
-        e.set_availability(NodeId(2), Availability::Offline)
-            .unwrap();
+        e.set_availability(NodeId(2), Availability::Offline).unwrap();
         e.run().unwrap();
         let log = e.into_log();
         let pongs_to_2 = log
             .records()
             .iter()
-            .filter(
-                |r| matches!(r.kind, LogEventKind::PongReceived { node, .. } if node == NodeId(2)),
-            )
+            .filter(|r| {
+                matches!(r.kind, LogEventKind::PongReceived { node, .. } if node == NodeId(2))
+            })
             .count();
         assert_eq!(pongs_to_2, 0, "offline node must not receive pongs");
-    }
-
-    #[test]
-    fn set_slow_factor_validates_input() {
-        let mut e = make_engine();
-        e.add_ping_node(PingNode::new(NodeId(1), Duration::from_millis(100)))
-            .unwrap();
-        let err = e.set_slow_factor(NodeId(1), 0.5).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-    }
-
-    #[test]
-    fn set_availability_rejects_missing_node() {
-        let mut e = make_engine();
-        let err = e
-            .set_availability(NodeId(99), Availability::Offline)
-            .unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

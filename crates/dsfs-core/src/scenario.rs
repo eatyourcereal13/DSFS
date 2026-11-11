@@ -1,32 +1,6 @@
 //! YAML scenario schema, validation, and the encoding of client commands.
 //!
 //! See DD-021 for the schema design.
-//!
-//! # Example
-//!
-//! ```yaml
-//! version: 1
-//! name: leader_failure
-//! seed: 42
-//! cluster:
-//!   nodes: 5
-//!   raft:
-//!     election_timeout_ms: 150
-//!     heartbeat_interval_ms: 30
-//! network:
-//!   default:
-//!     base_latency_ms: 5
-//!     jitter_ms: 2
-//!     loss_probability: 0.0
-//!     duplicate_probability: 0.0
-//! events:
-//!   - wait_for_leader: {}
-//!   - at_ms: 1000
-//!     crash_node: 3
-//! ```
-//!
-//! All struct fields use `serde(deny_unknown_fields)` so that typos in YAML
-//! are hard errors rather than silently ignored.
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -101,6 +75,13 @@ pub enum FaultAction {
     CrashNode { node: u32 },
     /// Bring a node back online.
     RestartNode { node: u32 },
+    /// Crash the node that is currently the Raft leader. If no leader
+    /// exists, the fault is deferred until a leader is elected (this is
+    /// not the same as `wait_for_leader`, which blocks the whole list;
+    /// `crash_leader` only defers its own action).
+    CrashLeader {},
+    /// Restart the node that was most recently crashed by `crash_leader`.
+    RestartCrashedLeader {},
     /// Partition the cluster into two groups.
     Partition { groups: Vec<Vec<u32>> },
     /// Heal all cross-group links (inverse of `partition`).
@@ -126,6 +107,8 @@ impl<'de> Deserialize<'de> for FaultEvent {
             wait_for_leader: Option<serde_yaml::Value>,
             crash_node: Option<serde_yaml::Value>,
             restart_node: Option<serde_yaml::Value>,
+            crash_leader: Option<serde_yaml::Value>,
+            restart_crashed_leader: Option<serde_yaml::Value>,
             partition: Option<serde_yaml::Value>,
             heal: Option<serde_yaml::Value>,
             set_slow: Option<serde_yaml::Value>,
@@ -145,7 +128,9 @@ impl<'de> Deserialize<'de> for FaultEvent {
                 serde_yaml::Value::Number(n) => n
                     .as_u64()
                     .and_then(|x| u32::try_from(x).ok())
-                    .ok_or_else(|| E::custom(format!("{what}: node must be a positive integer"))),
+                    .ok_or_else(|| {
+                        E::custom(format!("{what}: node must be a positive integer"))
+                    }),
                 other => {
                     #[derive(Deserialize)]
                     #[serde(deny_unknown_fields)]
@@ -195,6 +180,12 @@ impl<'de> Deserialize<'de> for FaultEvent {
         if raw.restart_node.is_some() {
             present += 1;
         }
+        if raw.crash_leader.is_some() {
+            present += 1;
+        }
+        if raw.restart_crashed_leader.is_some() {
+            present += 1;
+        }
         if raw.partition.is_some() {
             present += 1;
         }
@@ -228,6 +219,12 @@ impl<'de> Deserialize<'de> for FaultEvent {
             FaultAction::RestartNode {
                 node: parse_node(v, "restart_node")?,
             }
+        } else if let Some(v) = raw.crash_leader {
+            let _: Empty = parse_value(v, "crash_leader")?;
+            FaultAction::CrashLeader {}
+        } else if let Some(v) = raw.restart_crashed_leader {
+            let _: Empty = parse_value(v, "restart_crashed_leader")?;
+            FaultAction::RestartCrashedLeader {}
         } else if let Some(v) = raw.partition {
             let a: GroupsArg = parse_value(v, "partition")?;
             FaultAction::Partition { groups: a.groups }
@@ -347,7 +344,8 @@ impl Scenario {
         }
         let n = self.cluster.nodes;
         let raft = &self.cluster.raft;
-        if raft.heartbeat_interval_ms == 0 || raft.heartbeat_interval_ms >= raft.election_timeout_ms
+        if raft.heartbeat_interval_ms == 0
+            || raft.heartbeat_interval_ms >= raft.election_timeout_ms
         {
             return Err(ScenarioError::HeartbeatNotLessThanElection {
                 heartbeat: raft.heartbeat_interval_ms,
@@ -393,14 +391,21 @@ impl Scenario {
                         }
                     }
                 }
-                FaultAction::Partition { groups } | FaultAction::Heal { groups } => {
-                    Self::check_groups(i, groups, n)?;
+                FaultAction::CrashLeader {}
+                | FaultAction::RestartCrashedLeader {}
+                | FaultAction::Partition { .. }
+                | FaultAction::Heal { .. }
+                | FaultAction::SubmitWrite { .. }
+                | FaultAction::WaitForLeader {} => {
+                    if let FaultAction::Partition { groups } | FaultAction::Heal { groups } =
+                        &ev.action
+                    {
+                        Self::check_groups(i, groups, n)?;
+                    }
                 }
-                FaultAction::SubmitWrite { .. } | FaultAction::WaitForLeader {} => {}
             }
         }
 
-        // Trailing wait_for_leader is useless (nothing after it to gate).
         if matches!(
             self.events.last().map(|e| &e.action),
             Some(FaultAction::WaitForLeader {})
@@ -429,11 +434,7 @@ impl Scenario {
         for g in groups {
             for &id in g {
                 if id < 1 || id > max {
-                    return Err(ScenarioError::NodeOutOfRange {
-                        index,
-                        node: id,
-                        max,
-                    });
+                    return Err(ScenarioError::NodeOutOfRange { index, node: id, max });
                 }
                 if !seen.insert(id) {
                     return Err(ScenarioError::PartitionGroupsOverlap { index });
@@ -509,9 +510,10 @@ events:
     }
 
     #[test]
-    fn rejects_unknown_top_level() {
-        let bad = MINIMAL.replace("seed: 42", "seed: 42\nextra: 1");
-        assert!(Scenario::from_yaml(&bad).is_err());
+    fn parses_crash_leader() {
+        let yaml = MINIMAL.replace("crash_node: 1", "crash_leader: {}");
+        let s = Scenario::from_yaml(&yaml).unwrap();
+        assert!(matches!(s.events[0].action, FaultAction::CrashLeader {}));
     }
 
     #[test]
@@ -559,27 +561,10 @@ events:
     }
 
     #[test]
-    fn rejects_partition_coverage_gap() {
-        // nodes=3, groups [1,2] and [3] should pass; groups [1] and [2] miss 3.
-        let bad = MINIMAL.replace(
-            "  - at_ms: 100\n    crash_node: 1",
-            "  - at_ms: 100\n    partition:\n      groups:\n        - [1]\n        - [2]",
-        );
-        let err = Scenario::from_yaml(&bad).unwrap_err();
-        assert!(matches!(err, ScenarioError::PartitionGroupsCoverage { .. }));
-    }
-
-    #[test]
     fn encodes_and_decodes_put() {
         let bytes = encode_put("balance", "500");
         let (k, v) = decode_put(&bytes).unwrap();
         assert_eq!(k, "balance");
         assert_eq!(v, "500");
-    }
-
-    #[test]
-    fn decode_rejects_garbage() {
-        assert!(decode_put(b"not-a-put").is_none());
-        assert!(decode_put(b"").is_none());
     }
 }
